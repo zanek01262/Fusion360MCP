@@ -1,0 +1,9 @@
+# Python dependencies for the MCP server (fusion_mcp_server.py).
+# Install with:  python -m pip install -r requirements.txt
+#
+# NOTE: the Fusion add-in (MCPListener.py) needs NO dependencies — it uses only
+# Fusion's bundled Python and the standard library. These deps are only for the
+# MCP server that Claude Desktop launches.
+
+mcp[cli]>=1.2.0
+requests>=2.31.0
