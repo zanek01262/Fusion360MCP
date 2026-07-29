@@ -29,6 +29,8 @@ LISTENER_URL = "http://127.0.0.1:8765"
 # socket timeout.
 SYNC_WAIT_S = 100.0
 HTTP_TIMEOUT_S = 115.0
+_last_job_id = [None]   # most recent job, so a timeout can name it
+SERVER_VERSION = "1.4.1"
 EXPECTED_PROTOCOL = 2
 
 MISMATCH_MSG = (
@@ -97,17 +99,58 @@ def _send(code: str) -> str:
         r = requests.post(LISTENER_URL + "/exec_sync",
                           json={"code": code, "wait_s": SYNC_WAIT_S},
                           timeout=HTTP_TIMEOUT_S)
-        return _fmt_envelope(r.json())
+        data = r.json()
+        if data.get("job_id"):
+            _last_job_id[0] = data["job_id"]
+        return _fmt_envelope(data)
     except requests.exceptions.ConnectionError:
         return ("CONNECTION ERROR: could not reach Fusion listener at "
                 + LISTENER_URL
                 + "\nIs Fusion open with the MCPListener add-in running?")
     except requests.exceptions.ReadTimeout:
-        return ("HTTP TIMEOUT after {}s, but the listener runs jobs "
-                "asynchronously - the operation is likely still executing. Use "
-                "heartbeat() to check liveness and get_state() for doc/body "
-                "counts (both stay responsive during a long op)."
-                .format(HTTP_TIMEOUT_S))
+        # The job is STILL RUNNING - it may even have completed (including a
+        # save). Never present this as a failure, and never re-run the call.
+        jid = _last_job_id[0]
+        return ("STATUS: RUNNING  (transport wait exceeded {}s)\n"
+                "The operation is STILL EXECUTING in Fusion and may already have "
+                "completed - do NOT re-issue this call (that stacks a second "
+                "job).\n"
+                "{}"
+                "get_state() and heartbeat() stay responsive during a long op."
+                .format(HTTP_TIMEOUT_S,
+                        "Poll job_status('%s') for the result.\n" % jid
+                        if jid else
+                        "Call heartbeat() for the current job id, then "
+                        "job_status(<id>).\n"))
+    except Exception as e:
+        return "CONNECTION ERROR: {}".format(e)
+
+
+# Camera presets shared by view_model / set_view. 'bottom' included; an
+# unrecognised orientation is reported as an ERROR rather than silently
+# falling back to iso.
+# NOTE: braces are doubled because these fragments are concatenated into
+# templates that are then passed through .format().
+VIEWS = ("eyes = {{'iso':(10,-10,10),'top':(0,0,10),'bottom':(0,0,-10),"
+         "'front':(0,-10,0),'back':(0,10,0),'right':(10,0,0),'left':(-10,0,0)}}\n")
+UPS = ("ups = {{'iso':(0,0,1),'top':(0,1,0),'bottom':(0,-1,0),"
+       "'front':(0,0,1),'back':(0,0,1),'right':(0,0,1),'left':(0,0,1)}}\n")
+
+
+def _send_async(code: str) -> str:
+    """Start code as an async job and return the job_id immediately. Used by
+    tools that can outlive the wire (clear_document, big patterns)."""
+    try:
+        r = requests.post(LISTENER_URL + "/exec", json={"code": code}, timeout=10)
+        d = r.json()
+        pm = _check_protocol(d)
+        if pm:
+            return pm
+        jid = d.get("job_id")
+        return ("STATUS: QUEUED  [job {}]\n"
+                "Started as a background job so the channel is not blocked.\n"
+                "Poll job_status('{}') for incremental progress and the final "
+                "result.".format(jid, jid))
     except Exception as e:
         return "CONNECTION ERROR: {}".format(e)
 
@@ -134,9 +177,18 @@ def ping_fusion() -> str:
         pm = _check_protocol(d)
         if pm:
             return pm
-        return ("SUCCESS:\nlistener v{} alive={} busy={} current_job={} idle_seconds={}\n{}"
-                .format(d.get("listener_version"), d.get("alive"), d.get("busy"),
-                        d.get("current_job"), d.get("idle_seconds"), d.get("output", "")))
+        lv = d.get("listener_version")
+        warn = ""
+        if lv and lv != SERVER_VERSION:
+            warn = ("\nNOTE: server v{} vs listener v{}. These are separate files "
+                    "in separate folders - the listener lives in Fusion's AddIns "
+                    "folder. Update whichever is older, then Stop/Run the add-in."
+                    .format(SERVER_VERSION, lv))
+        return ("SUCCESS:\nserver v{} | listener v{} | alive={} busy={} "
+                "current_job={} idle_seconds={}\n{}{}"
+                .format(SERVER_VERSION, lv, d.get("alive"), d.get("busy"),
+                        d.get("current_job"), d.get("idle_seconds"),
+                        d.get("output", ""), warn))
     except Exception as e:
         return ("CONNECTION ERROR: {}\nOpen Fusion 360 and start the MCPListener "
                 "add-in (Utilities > Add-Ins > MCPListener > Run).".format(e))
@@ -232,11 +284,17 @@ def run_fusion_code(code: str) -> str:
       - XZ plane: sketch X -> world X, sketch Y -> world -Z (INVERTED). A positive
         extrude distance off XZ goes -Y. This sign flip is the usual cause of
         "my extrude went the wrong way" - negate the distance or the sketch Y.
-      - YZ plane: sketch X -> world Y, sketch Y -> world Z. Positive extrude -> -X.
+      - YZ plane (MEASURED on this build): sketch X -> world -Z, sketch Y ->
+        world +Y, i.e. sketch(u,v) -> world(0, v, -u). Positive extrude -> -X.
+        (Older docs claimed 'sketch X -> world Y, sketch Y -> world Z' - that
+        is WRONG and produces a plausible body with a correct bounding box and
+        correct profile area that only reveals itself several ops later.)
       - On an OFFSET construction plane, the sketch origin is on that plane, not
         at world zero - account for the offset in your coordinates.
-      When unsure, build on XY and reposition, or verify with view_model +
-      cross_section immediately after the extrude.
+      DON'T reason about this by hand - use the injected helpers P_xy(x,y),
+      P_xz(x,z), P_yz(y,z), which take WORLD mm and return the correct sketch
+      point, and call verify_plane_mapping(sketch) once on any new/offset/
+      tangent plane to print its measured basis.
 
     KNOWN-UNSTABLE (refused by the listener - do not attempt): move-face via
     defineAsFreeMove (hard-crashes the host), defineAsOffset (missing on this
@@ -292,40 +350,84 @@ def run_fusion_code_safe(code: str) -> str:
 
 
 @mcp.tool()
-def clear_document() -> str:
-    """Delete all bodies, sketches, and timeline features in the active design,
-    returning it to an empty state. Use before modeling a fresh single part."""
+def clear_document(background: bool = True) -> str:
+    """Delete all bodies, sketches, and timeline features in the active design.
+
+    Implemented as REVERSE-ORDER timeline deletion via `item(i).entity.deleteMe()`
+    (note: TimelineObject itself has NO deleteMe - only .entity does). This runs
+    in milliseconds per feature; the old bulk approach could hang for 10+ minutes
+    and take the Fusion session down with it.
+
+    background=True (default) runs it through the async job system and returns a
+    job_id immediately, so the channel is never blocked - poll job_status().
+    Emits progress() per feature.
+
+    SAFER ALTERNATIVE: to replace one body, don't clear at all - build the new
+    body, then retire the old one with retire_body(old) (backed by
+    removeFeatures). That keeps history and cannot destroy unrelated work.
+    Check get_state() for the active document before clearing."""
     code = (
         "design = app.activeProduct\n"
         "root = design.rootComponent\n"
-        "# roll timeline marker to end so everything is deletable\n"
+        "progress('starting reverse-order timeline clear')\n"
+        "removed = 0\n"
         "try:\n"
         "    tl = design.timeline\n"
-        "    tl.moveToEnd()\n"
-        "except Exception:\n"
-        "    pass\n"
-        "while root.bRepBodies.count > 0:\n"
-        "    root.bRepBodies.item(0).deleteMe()\n"
-        "while root.sketches.count > 0:\n"
-        "    root.sketches.item(0).deleteMe()\n"
-        "# clear any remaining timeline features\n"
-        "try:\n"
-        "    tl = design.timeline\n"
-        "    while tl.count > 0:\n"
+        "    n = tl.count\n"
+        "    progress('timeline has %d feature(s)' % n)\n"
+        "    for i in range(n - 1, -1, -1):\n"
         "        try:\n"
-        "            tl.item(0).deleteMe()\n"
+        "            obj = tl.item(i)\n"
+        "            ent = obj.entity          # TimelineObject has no deleteMe\n"
+        "            if ent is not None:\n"
+        "                ent.deleteMe()\n"
+        "                removed += 1\n"
+        "                if removed % 10 == 0:\n"
+        "                    progress('deleted %d feature(s)' % removed)\n"
+        "        except Exception as _e:\n"
+        "            progress('skip feature %d: %s' % (i, str(_e)[:60]))\n"
+        "except Exception as _te:\n"
+        "    print('no usable timeline (%s) - falling back to direct deletes'\n"
+        "          % str(_te)[:60])\n"
+        "# Fallback sweep ONLY for direct-modelling docs with no timeline.\n"
+        "# Bulk bRepBodies.deleteMe() on a PARAMETRIC doc creates a delete\n"
+        "# feature per body and is exactly the path that hung for 10+ minutes,\n"
+        "# so it is never used when a timeline exists.\n"
+        "_has_timeline = False\n"
+        "try:\n"
+        "    _has_timeline = design.timeline.count >= 0\n"
+        "except Exception:\n"
+        "    _has_timeline = False\n"
+        "if _has_timeline and (root.bRepBodies.count or root.sketches.count):\n"
+        "    print('NOTE: %d body/ies and %d sketch(es) remain after clearing the'\n"
+        "          % (root.bRepBodies.count, root.sketches.count))\n"
+        "    print('      timeline. NOT falling back to bulk deleteMe() - that is'\n"
+        "          ' the path that hangs on parametric documents.')\n"
+        "    print('      Retire individual bodies with retire_body(body), or'\n"
+        "          ' delete them in the Fusion UI.')\n"
+        "elif not _has_timeline:\n"
+        "    progress('no timeline (direct-modelling doc) - sweeping directly')\n"
+        "    guard = 0\n"
+        "    while root.bRepBodies.count > 0 and guard < 200:\n"
+        "        try:\n"
+        "            root.bRepBodies.item(0).deleteMe()\n"
         "        except Exception:\n"
         "            break\n"
-        "except Exception:\n"
-        "    pass\n"
-        "print('cleared')\n"
+        "        guard += 1\n"
+        "    while root.sketches.count > 0 and guard < 400:\n"
+        "        try:\n"
+        "            root.sketches.item(0).deleteMe()\n"
+        "        except Exception:\n"
+        "            break\n"
+        "        guard += 1\n"
+        "print('cleared: %d timeline feature(s) deleted; bodies=%d sketches=%d'\n"
+        "      % (removed, root.bRepBodies.count, root.sketches.count))\n"
     )
+    if background:
+        return _send_async(code)
     return _send(code)
 
 
-# ==========================================================================
-# PARAMETERS
-# ==========================================================================
 @mcp.tool()
 def set_parameter(name: str, value_mm: float) -> str:
     """Set (or create) a user parameter by name, in millimeters. Driving a
@@ -335,14 +437,14 @@ def set_parameter(name: str, value_mm: float) -> str:
         "design = app.activeProduct\n"
         "ups = design.userParameters\n"
         "expr = '{v} mm'\n"
-        "p = ups.itemByName('{n}')\n"
+        "p = ups.itemByName({n!r})\n"
         "if p:\n"
         "    p.expression = expr\n"
-        "    print('updated {n} = ' + expr)\n"
+        "    print('updated ' + str({n!r}) + ' = ' + expr)\n"
         "else:\n"
         "    val = adsk.core.ValueInput.createByString(expr)\n"
-        "    ups.add('{n}', val, 'mm', '')\n"
-        "    print('created {n} = ' + expr)\n"
+        "    ups.add({n!r}, val, 'mm', '')\n"
+        "    print('created ' + str({n!r}) + ' = ' + expr)\n"
     ).format(v=value_mm, n=name)
     return _send(code)
 
@@ -453,20 +555,43 @@ def fillet_edges(radius_mm: float, body_index: int = 0, which: str = "all") -> s
         "    ep = e.endVertex.geometry\n"
         "    is_vertical = abs(sp.z - ep.z) > 1e-6\n"
         "    on_top = (abs(sp.z - maxz) < 1e-6) and (abs(ep.z - maxz) < 1e-6)\n"
-        "    if '{w}' == 'all':\n"
+        "    if {w!r} == 'all':\n"
         "        edges.add(e)\n"
-        "    elif '{w}' == 'vertical' and is_vertical:\n"
+        "    elif {w!r} == 'vertical' and is_vertical:\n"
         "        edges.add(e)\n"
-        "    elif '{w}' == 'top' and on_top:\n"
+        "    elif {w!r} == 'top' and on_top:\n"
         "        edges.add(e)\n"
         "if edges.count == 0:\n"
         "    print('WARN: no edges matched which={w}')\n"
         "else:\n"
+        "    _len_mm = 0.0\n"
+        "    for _e in edges:\n"
+        "        try:\n"
+        "            _len_mm += _e.length * 10.0\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "    _before = sum((b.volume if b.isValid else 0) for b in root.bRepBodies)\n"
         "    fil = root.features.filletFeatures\n"
         "    inp = fil.createInput()\n"
         "    inp.addConstantRadiusEdgeSet(edges, adsk.core.ValueInput.createByReal({R}), True)\n"
         "    fil.add(inp)\n"
+        "    _after = sum((b.volume if b.isValid else 0) for b in root.bRepBodies)\n"
+        "    _delta = _after - _before\n"
         "    print('filleted ' + str(edges.count) + ' edges (which={w}, r={rmm}mm)')\n"
+        "    # A fillet of radius r along length L changes volume by at most\n"
+        "    # ~0.1*r^2*L. A big overshoot means the blend propagated past the\n"
+        "    # intended edges (tangent chain running into adjacent geometry).\n"
+        "    # Fusion reports SUCCESS and the body stays valid, so this is the\n"
+        "    # only cheap detector.\n"
+        "    _exp = 0.1 * ({rmm} ** 2) * _len_mm\n"
+        "    _act = abs(_delta) * 1000.0\n"
+        "    print('  volume delta %.2f mm^3 (expected <= ~%.2f for r=%s, L=%.1fmm)'\n"
+        "          % (_act, _exp, {rmm}, _len_mm))\n"
+        "    if _exp > 0 and _act > 10.0 * _exp:\n"
+        "        print('  *** WARNING: %.1fx the expected maximum - the fillet '\n"
+        "              'likely propagated BEYOND the selected edges and may have '\n"
+        "              'filled in geometry elsewhere. Verify with cross_section.'\n"
+        "              % (_act / _exp))\n"
     ).format(bi=body_index, w=which, R=R, rmm=radius_mm)
     return _send(code)
 
@@ -540,6 +665,7 @@ def tapped_hole(thread_size: str, x_mm: float, y_mm: float, depth_mm: float,
         "design = app.activeProduct\n"
         "root = design.rootComponent\n"
         "body = root.bRepBodies.item({bi})\n"
+        "_ts = {ts!r}\n"
         "_before = sum((b.volume if b.isValid else 0) for b in root.bRepBodies)\n"
         "sk = root.sketches.add(root.xYConstructionPlane)\n"
         "ctr = adsk.core.Point3D.create({x}, {y}, 0)\n"
@@ -551,7 +677,7 @@ def tapped_hole(thread_size: str, x_mm: float, y_mm: float, depth_mm: float,
         "hole = ext.add(inp)\n"
         "_after = sum((b.volume if b.isValid else 0) for b in root.bRepBodies)\n"
         "_delta = _after - _before\n"
-        "print('tap-drill hole ({ts}, dia {dmm}mm) cut at ({xm},{ym})mm | volume delta: {{:+.4f}} cm^3'.format(_delta))\n"
+        "print('tap-drill hole (' + str(_ts) + ', dia {dmm}mm) cut at ({xm},{ym})mm | volume delta: ' + '{{:+.4f}}'.format(_delta) + ' cm^3')\n"
         "if abs(_delta) < 1e-7:\n"
         "    print('WARNING: volume delta ~ZERO - tap-drill cut had NO effect (missed body / wrong location / depth).')\n"
         "if not {tdo}:\n"
@@ -606,7 +732,7 @@ def sketch_on_face(component_name: str = "", which: str = "top",
         "design = app.activeProduct\n"
         "root = design.rootComponent\n"
         "host = root\n"
-        "cn = '{cn}'\n"
+        "cn = {cn!r}\n"
         "if cn:\n"
         "    for occ in root.allOccurrences:\n"
         "        if occ.component.name == cn:\n"
@@ -614,7 +740,7 @@ def sketch_on_face(component_name: str = "", which: str = "top",
         "            break\n"
         "body = host.bRepBodies.item({bi})\n"
         "sel = {{'top':('z','max'),'bottom':('z','min'),'front':('y','min'),"
-        "'back':('y','max'),'right':('x','max'),'left':('x','min')}}['{w}']\n"
+        "'back':('y','max'),'right':('x','max'),'left':('x','min')}}[{w!r}]\n"
         "axis, mode = sel\n"
         "best = None\n"
         "bestv = None\n"
@@ -625,7 +751,7 @@ def sketch_on_face(component_name: str = "", which: str = "top",
         "import __main__ as _m\n"
         "_m._mcp_face = best\n"
         "c = best.centroid\n"
-        "print('selected {w} face: centroid=({{:.2f}},{{:.2f}},{{:.2f}})cm area={{:.3f}}'.format(c.x,c.y,c.z,best.area))\n"
+        "print('selected ' + str({w!r}) + ' face: centroid=({{:.2f}},{{:.2f}},{{:.2f}})cm area={{:.3f}}'.format(c.x,c.y,c.z,best.area))\n"
     ).format(cn=component_name, bi=body_index, w=which)
     return _send(code)
 
@@ -759,17 +885,18 @@ def measure_distance(which_a: str, which_b: str, body_index: int = 0) -> str:
         "        if best is None or (mode=='max' and v>bv) or (mode=='min' and v<bv):\n"
         "            best,bv=f,v\n"
         "    return best\n"
-        "fa=pick('{a}'); fb=pick('{b}')\n"
+        "fa=pick({a!r}); fb=pick({b!r})\n"
         "ca,cb=fa.centroid,fb.centroid\n"
         "d=math.sqrt((ca.x-cb.x)**2+(ca.y-cb.y)**2+(ca.z-cb.z)**2)*10\n"
-        "print('distance {a}<->{b} = {{:.3f}} mm'.format(d))\n"
+        "print('distance ' + str({a!r}) + '<->' + str({b!r}) + ' = {{:.3f}} mm'.format(d))\n"
     ).format(bi=body_index, a=which_a, b=which_b)
     return _send(code)
 
 
 @mcp.tool()
 def cross_section(body_index: int = 0, axis: str = "z", at_mm: float = None,
-                  span_axis: str = "x", samples: int = 41) -> str:
+                  span_axis: str = "x", samples: int = 41,
+                  at_a_mm: float = None, at_b_mm: float = None) -> str:
     """Scan a line of points through a body and report solid/void as an ASCII
     row - the single most useful geometry diagnostic for spotting trapped voids,
     missed cuts, or wrong wall thickness without a screenshot.
@@ -778,6 +905,11 @@ def cross_section(body_index: int = 0, axis: str = "z", at_mm: float = None,
     held at the mid-value of the other two axes (or at `at_mm` along `axis` if
     given). '#'=solid, '.'=void. Also prints the mm coordinates where solid/void
     boundaries occur, so you can read off wall positions and gaps numerically.
+
+    By default the two non-span axes are held at their bbox MID-value. Pin them
+    explicitly with at_a_mm / at_b_mm (in the axis order X,Y,Z excluding
+    span_axis) to scan through a specific feature - e.g. a vent tube at x=3.8:
+    cross_section(span_axis='y', at_a_mm=3.8) scans along Y at x=3.8.
 
     Example: cross_section(axis='z', at_mm=5, span_axis='x') samples across X at
     Z=5mm and shows where material starts/stops along X."""
@@ -788,8 +920,8 @@ def cross_section(body_index: int = 0, axis: str = "z", at_mm: float = None,
         "body = root.bRepBodies.item({bi})\n"
         "bb = body.boundingBox\n"
         "mn, mx = bb.minPoint, bb.maxPoint\n"
-        "ax = '{ax}'\n"
-        "span = '{sp}'\n"
+        "ax = {ax!r}\n"
+        "span = {sp!r}\n"
         "at = {at}\n"
         "N = {n}\n"
         "def axval(p, a):\n"
@@ -798,8 +930,11 @@ def cross_section(body_index: int = 0, axis: str = "z", at_mm: float = None,
         "all_axes = ['x','y','z']\n"
         "others = [a for a in all_axes if a != span]\n"
         "fixed = {{}}\n"
-        "for a in others:\n"
-        "    if a == ax and at is not None:\n"
+        "PINS = {pins!r}\n"
+        "for idx, a in enumerate(others):\n"
+        "    if PINS[idx] is not None:\n"
+        "        fixed[a] = PINS[idx] / 10.0     # mm -> cm\n"
+        "    elif a == ax and at is not None:\n"
         "        fixed[a] = at\n"
         "    else:\n"
         "        fixed[a] = (axval(mn,a)+axval(mx,a))/2.0\n"
@@ -827,7 +962,8 @@ def cross_section(body_index: int = 0, axis: str = "z", at_mm: float = None,
         "        kind = 'void->solid' if states[i][1] else 'solid->void'\n"
         "        bounds.append('{{:.2f}}mm {{}}'.format(edge_mm, kind))\n"
         "print('boundaries: ' + ('; '.join(bounds) if bounds else 'none (uniform)'))\n"
-    ).format(bi=body_index, ax=axis, sp=span_axis, at=at_expr, n=max(5, samples))
+    ).format(bi=body_index, ax=axis, sp=span_axis, at=at_expr, n=max(5, samples),
+             pins=[at_a_mm, at_b_mm])
     return _send(code)
 
 
@@ -920,38 +1056,68 @@ def heartbeat() -> str:
 # VISUAL FEEDBACK
 # ==========================================================================
 @mcp.tool()
-def view_model(orientation: str = "iso") -> Image:
-    """Orient the camera (iso/top/front/right/left/back), fit, screenshot the
-    viewport, and RETURN the image so it can be seen directly. Call after
-    non-trivial operations to visually verify geometry. Raises on failure."""
+def view_model(orientation: str = "iso",
+               zoom_x_mm: float = None, zoom_y_mm: float = None,
+               zoom_z_mm: float = None, zoom_radius_mm: float = None) -> Image:
+    """Orient the camera, fit, screenshot the viewport, and RETURN the image.
+
+    orientation: iso / top / bottom / front / back / left / right. An
+    unrecognised value is an ERROR (it used to silently return the previous
+    view, which reads as "nothing changed" and wastes a round trip).
+
+    ZOOM: pass zoom_x_mm/zoom_y_mm/zoom_z_mm plus zoom_radius_mm to frame a
+    small detail instead of fitting the whole model. Inspecting a 4 mm feature
+    on a 76 mm part is impossible with a whole-model fit.
+    """
     tmp = os.path.join(os.path.expanduser("~"), "fusion_view.png")
-    # remove stale file so we don't return an old frame on silent failure
     try:
         if os.path.exists(tmp):
             os.remove(tmp)
     except Exception:
         pass
+    zoom = None
+    if None not in (zoom_x_mm, zoom_y_mm, zoom_z_mm) and zoom_radius_mm:
+        zoom = (zoom_x_mm / 10.0, zoom_y_mm / 10.0, zoom_z_mm / 10.0,
+                zoom_radius_mm / 10.0)
     code = (
         "vp = app.activeViewport\n"
         "cam = vp.camera\n"
-        "o = '{o}'\n"
-        "eyes = {{'iso':(10,-10,10),'top':(0,0,10),'front':(0,-10,0),"
-        "'back':(0,10,0),'right':(10,0,0),'left':(-10,0,0)}}\n"
-        "ups = {{'iso':(0,0,1),'top':(0,1,0),'front':(0,0,1),"
-        "'back':(0,0,1),'right':(0,0,1),'left':(0,0,1)}}\n"
-        "eye = eyes.get(o, eyes['iso'])\n"
-        "up = ups.get(o, ups['iso'])\n"
-        "cam.eye = adsk.core.Point3D.create(eye[0],eye[1],eye[2])\n"
-        "cam.target = adsk.core.Point3D.create(0,0,0)\n"
-        "cam.upVector = adsk.core.Vector3D.create(up[0],up[1],up[2])\n"
-        "cam.isSmoothTransition = False\n"
-        "vp.camera = cam\n"
-        "vp.fit()\n"
-        "adsk.doEvents()\n"
-        "res = vp.saveAsImageFile(r'{path}', 1200, 900)\n"
-        "print('screenshot ok' if res else 'screenshot FAILED')\n"
-    ).format(o=orientation, path=tmp)
+        "o = {o!r}\n"
+        + VIEWS + UPS +
+        "if o not in eyes:\n"
+        "    print('ERROR: unknown orientation %r. Valid: %s'\n"
+        "          % (o, ', '.join(sorted(eyes))))\n"
+        "else:\n"
+        "    eye = eyes[o]; up = ups[o]\n"
+        "    ZOOM = {z!r}\n"
+        "    if ZOOM:\n"
+        "        cx, cy, cz, rad = ZOOM\n"
+        "        d = max(rad * 4.0, 0.1)\n"
+        "        import math\n"
+        "        L = math.sqrt(eye[0]**2 + eye[1]**2 + eye[2]**2) or 1.0\n"
+        "        ux, uy, uz = eye[0]/L, eye[1]/L, eye[2]/L\n"
+        "        cam.target = adsk.core.Point3D.create(cx, cy, cz)\n"
+        "        cam.eye = adsk.core.Point3D.create(cx+ux*d, cy+uy*d, cz+uz*d)\n"
+        "        cam.upVector = adsk.core.Vector3D.create(up[0],up[1],up[2])\n"
+        "        cam.isSmoothTransition = False\n"
+        "        cam.viewExtents = rad * 2.2\n"
+        "        vp.camera = cam\n"
+        "        print('framed detail at (%.1f, %.1f, %.1f) mm, radius %.1f mm'\n"
+        "              % (cx*10, cy*10, cz*10, rad*10))\n"
+        "    else:\n"
+        "        cam.eye = adsk.core.Point3D.create(eye[0],eye[1],eye[2])\n"
+        "        cam.target = adsk.core.Point3D.create(0,0,0)\n"
+        "        cam.upVector = adsk.core.Vector3D.create(up[0],up[1],up[2])\n"
+        "        cam.isSmoothTransition = False\n"
+        "        vp.camera = cam\n"
+        "        vp.fit()\n"
+        "    adsk.doEvents()\n"
+        "    res = vp.saveAsImageFile({path!r}, 1200, 900)\n"
+        "    print('screenshot ok' if res else 'screenshot FAILED')\n"
+    ).format(o=orientation, z=zoom, path=tmp)
     result = _send(code)
+    if "unknown orientation" in result:
+        raise RuntimeError(result)
     if "screenshot ok" not in result or not os.path.exists(tmp):
         raise RuntimeError("view_model failed: " + result)
     with open(tmp, "rb") as f:
@@ -961,32 +1127,30 @@ def view_model(orientation: str = "iso") -> Image:
 
 @mcp.tool()
 def set_view(orientation: str = "iso") -> str:
-    """Orient the camera without returning an image (iso/top/front/right/left/back),
-    then fit. Use when you just want to reposition the view."""
+    """Orient the camera without returning an image (iso/top/bottom/front/back/
+    right/left), then fit. Unknown orientations are reported as an ERROR rather
+    than silently falling back to iso."""
     code = (
         "vp = app.activeViewport\n"
         "cam = vp.camera\n"
-        "o = '{o}'\n"
-        "eyes = {{'iso':(10,-10,10),'top':(0,0,10),'front':(0,-10,0),"
-        "'back':(0,10,0),'right':(10,0,0),'left':(-10,0,0)}}\n"
-        "ups = {{'iso':(0,0,1),'top':(0,1,0),'front':(0,0,1),"
-        "'back':(0,0,1),'right':(0,0,1),'left':(0,0,1)}}\n"
-        "eye = eyes.get(o, eyes['iso'])\n"
-        "up = ups.get(o, ups['iso'])\n"
-        "cam.eye = adsk.core.Point3D.create(eye[0],eye[1],eye[2])\n"
-        "cam.target = adsk.core.Point3D.create(0,0,0)\n"
-        "cam.upVector = adsk.core.Vector3D.create(up[0],up[1],up[2])\n"
-        "cam.isSmoothTransition = False\n"
-        "vp.camera = cam\n"
-        "vp.fit()\n"
-        "print('view set to ' + o)\n"
+        "o = {o!r}\n"
+        + VIEWS + UPS +
+        "if o not in eyes:\n"
+        "    print('ERROR: unknown orientation %r. Valid: %s'\n"
+        "          % (o, ', '.join(sorted(eyes))))\n"
+        "else:\n"
+        "    eye = eyes[o]; up = ups[o]\n"
+        "    cam.eye = adsk.core.Point3D.create(eye[0],eye[1],eye[2])\n"
+        "    cam.target = adsk.core.Point3D.create(0,0,0)\n"
+        "    cam.upVector = adsk.core.Vector3D.create(up[0],up[1],up[2])\n"
+        "    cam.isSmoothTransition = False\n"
+        "    vp.camera = cam\n"
+        "    vp.fit()\n"
+        "    print('view set to ' + str(o))\n"
     ).format(o=orientation)
     return _send(code)
 
 
-# ==========================================================================
-# COMPONENTS & OCCURRENCES
-# ==========================================================================
 @mcp.tool()
 def create_component(name: str) -> str:
     """Create a new empty component placed as an occurrence at the assembly
@@ -996,7 +1160,7 @@ def create_component(name: str) -> str:
         "root = design.rootComponent\n"
         "m = adsk.core.Matrix3D.create()\n"
         "occ = root.occurrences.addNewComponent(m)\n"
-        "occ.component.name = '{n}'\n"
+        "occ.component.name = {n!r}\n"
         "print('created component occurrence: ' + occ.fullPathName)\n"
     ).format(n=name)
     return _send(code)
@@ -1031,11 +1195,11 @@ def box_in_component(component_name: str, length_mm: float, width_mm: float,
         "root = design.rootComponent\n"
         "comp = None\n"
         "for occ in root.allOccurrences:\n"
-        "    if occ.component.name == '{cn}':\n"
+        "    if occ.component.name == {cn!r}:\n"
         "        comp = occ.component\n"
         "        break\n"
         "if comp is None:\n"
-        "    print('ERROR: no component named {cn}')\n"
+        "    print('ERROR: no component named ' + str({cn!r}))\n"
         "else:\n"
         "    sk = comp.sketches.add(comp.xYConstructionPlane)\n"
         "    p0 = adsk.core.Point3D.create({ox}, {oy}, {oz})\n"
@@ -1045,7 +1209,7 @@ def box_in_component(component_name: str, length_mm: float, width_mm: float,
         "    ext = comp.features.extrudeFeatures\n"
         "    dist = adsk.core.ValueInput.createByReal({H})\n"
         "    feat = ext.addSimple(prof, dist, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)\n"
-        "    print('added box to {cn}: ' + feat.bodies.item(0).name)\n"
+        "    print('added box to ' + str({cn!r}) + ': ' + feat.bodies.item(0).name)\n"
     ).format(cn=component_name, ox=ox, oy=oy, oz=oz, x1=ox + L, y1=oy + W, H=H)
     return _send(code)
 
@@ -1060,11 +1224,11 @@ def move_component(component_name: str, x_mm: float, y_mm: float, z_mm: float) -
         "root = design.rootComponent\n"
         "target = None\n"
         "for occ in root.allOccurrences:\n"
-        "    if occ.component.name == '{cn}':\n"
+        "    if occ.component.name == {cn!r}:\n"
         "        target = occ\n"
         "        break\n"
         "if target is None:\n"
-        "    print('ERROR: no component named {cn}')\n"
+        "    print('ERROR: no component named ' + str({cn!r}))\n"
         "else:\n"
         "    m = adsk.core.Matrix3D.create()\n"
         "    m.translation = adsk.core.Vector3D.create({x}, {y}, {z})\n"
@@ -1074,7 +1238,7 @@ def move_component(component_name: str, x_mm: float, y_mm: float, z_mm: float) -
         "            design.snapshots.add()\n"
         "    except Exception:\n"
         "        pass\n"
-        "    print('moved {cn} to ({xm},{ym},{zm})mm')\n"
+        "    print('moved ' + str({cn!r}) + ' to ({xm},{ym},{zm})mm')\n"
     ).format(cn=component_name, x=x, y=y, z=z, xm=x_mm, ym=y_mm, zm=z_mm)
     return _send(code)
 
@@ -1091,11 +1255,11 @@ def copy_component(component_name: str, count: int, dx_mm: float = 0,
         "root = design.rootComponent\n"
         "src = None\n"
         "for occ in root.allOccurrences:\n"
-        "    if occ.component.name == '{cn}':\n"
+        "    if occ.component.name == {cn!r}:\n"
         "        src = occ\n"
         "        break\n"
         "if src is None:\n"
-        "    print('ERROR: no component named {cn}')\n"
+        "    print('ERROR: no component named ' + str({cn!r}))\n"
         "else:\n"
         "    base = src.transform.translation\n"
         "    made = 0\n"
@@ -1104,7 +1268,7 @@ def copy_component(component_name: str, count: int, dx_mm: float = 0,
         "        m.translation = adsk.core.Vector3D.create(base.x+{dx}*i, base.y+{dy}*i, base.z+{dz}*i)\n"
         "        root.occurrences.addExistingComponent(src.component, m)\n"
         "        made += 1\n"
-        "    print('placed ' + str(made) + ' more occurrences of {cn}')\n"
+        "    print('placed ' + str(made) + ' more occurrences of ' + str({cn!r}))\n"
     ).format(cn=component_name, cnt=count, dx=dx, dy=dy, dz=dz)
     return _send(code)
 
@@ -1118,14 +1282,14 @@ def ground_component(component_name: str, grounded: bool = True) -> str:
         "root = design.rootComponent\n"
         "target = None\n"
         "for occ in root.allOccurrences:\n"
-        "    if occ.component.name == '{cn}':\n"
+        "    if occ.component.name == {cn!r}:\n"
         "        target = occ\n"
         "        break\n"
         "if target is None:\n"
-        "    print('ERROR: no component named {cn}')\n"
+        "    print('ERROR: no component named ' + str({cn!r}))\n"
         "else:\n"
         "    target.isGrounded = {g}\n"
-        "    print('{cn} grounded={g}')\n"
+        "    print(str({cn!r}) + ' grounded={g}')\n"
     ).format(cn=component_name, g=grounded)
     return _send(code)
 
@@ -1221,16 +1385,16 @@ def _joint_code(ca, cb, motion, axis, use_origin, ax, ay, az, bx, by, bz):
         "        if occ.component.name == name:\n"
         "            return occ\n"
         "    return None\n"
-        "a = find('{ca}')\n"
-        "b = find('{cb}')\n"
+        "a = find({ca!r})\n"
+        "b = find({cb!r})\n"
         "if not a or not b:\n"
-        "    print('ERROR: component not found (a={ca} b={cb})')\n"
+        "    print('ERROR: component not found (a=' + str({ca!r}) + ' b=' + str({cb!r}) + ')')\n"
         "else:\n"
         + geo_setup +
         "    ji = root.joints.createInput(ga, gb)\n"
         + motion_setup +
         "    root.joints.add(ji)\n"
-        "    print('{motion} joint created: {ca} <-> {cb}')\n"
+        "    print('{motion} joint created: ' + str({ca!r}) + ' <-> ' + str({cb!r}))\n"
     ).format(ca=ca, cb=cb, motion=motion)
 
 
@@ -1243,9 +1407,9 @@ def export_step(filepath: str) -> str:
     code = (
         "design = app.activeProduct\n"
         "em = design.exportManager\n"
-        "opts = em.createSTEPExportOptions(r'{fp}')\n"
+        "opts = em.createSTEPExportOptions({fp!r})\n"
         "em.execute(opts)\n"
-        "print('exported STEP to {fp}')\n"
+        "print('exported STEP to ' + str({fp!r}))\n"
     ).format(fp=filepath)
     return _send(code)
 
@@ -1253,19 +1417,26 @@ def export_step(filepath: str) -> str:
 @mcp.tool()
 def export_stl(filepath: str, body_index: int = 0, quality: str = "medium") -> str:
     """Export a body to STL for 3D printing. quality: low/medium/high."""
-    qmap = {"low": "LowQualityTriangleMeshRefinement",
-            "medium": "MediumQualityTriangleMeshRefinement",
-            "high": "HighQualityTriangleMeshRefinement"}
+    # Actual members on this build are MeshRefinementLow/Medium/High/Custom.
+    # The *QualityTriangleMeshRefinement names do NOT exist and raise
+    # AttributeError at every quality setting.
+    qmap = {"low": "MeshRefinementLow",
+            "medium": "MeshRefinementMedium",
+            "high": "MeshRefinementHigh"}
     ref = qmap.get(quality, qmap["medium"])
     code = (
         "design = app.activeProduct\n"
         "root = design.rootComponent\n"
         "body = root.bRepBodies.item({bi})\n"
         "em = design.exportManager\n"
-        "opts = em.createSTLExportOptions(body, r'{fp}')\n"
-        "opts.meshRefinement = adsk.fusion.MeshRefinementSettings.{ref}\n"
+        "opts = em.createSTLExportOptions(body, {fp!r})\n"
+        "try:\n"
+        "    opts.meshRefinement = getattr(adsk.fusion.MeshRefinementSettings, {ref!r})\n"
+        "except AttributeError:\n"
+        "    _avail = [a for a in dir(adsk.fusion.MeshRefinementSettings) if 'Refinement' in a]\n"
+        "    print('WARN: {ref} missing; available: ' + str(_avail))\n"
         "em.execute(opts)\n"
-        "print('exported STL to {fp}')\n"
+        "print('exported STL to ' + str({fp!r}))\n"
     ).format(bi=body_index, fp=filepath, ref=ref)
     return _send(code)
 
@@ -1279,7 +1450,7 @@ def export_dxf(filepath: str, sketch_index: int = 0,
         "design = app.activeProduct\n"
         "root = design.rootComponent\n"
         "host = root\n"
-        "cn = '{cn}'\n"
+        "cn = {cn!r}\n"
         "if cn:\n"
         "    for occ in root.allOccurrences:\n"
         "        if occ.component.name == cn:\n"
@@ -1289,8 +1460,8 @@ def export_dxf(filepath: str, sketch_index: int = 0,
         "    print('ERROR: no sketches to export')\n"
         "else:\n"
         "    sk = host.sketches.item({si})\n"
-        "    sk.saveAsDXF(r'{fp}')\n"
-        "    print('exported DXF to {fp}')\n"
+        "    sk.saveAsDXF({fp!r})\n"
+        "    print('exported DXF to ' + str({fp!r}))\n"
     ).format(cn=component_name, si=sketch_index, fp=filepath)
     return _send(code)
 
@@ -1323,9 +1494,31 @@ def save_document(name: str = "", create_new: bool = False) -> str:
         "name = {n!r}\n"
         "create_new = {cn}\n"
         "try:\n"
-        "    proj = app.data.activeProject\n"
-        "    folder = proj.rootFolder\n"
-        "    if create_new:\n"
+        "    proj = None\n"
+        "    folder = None\n"
+        "    _data_ok = True\n"
+        "    try:\n"
+        "        proj = app.data.activeProject\n"
+        "        folder = proj.rootFolder\n"
+        "    except Exception as _de:\n"
+        "        _data_ok = False\n"
+        "        print('NOTE: app.data is unavailable (%s).' % str(_de)[:70])\n"
+        "        print('      This build can throw InternalValidationError '\n"
+        "              'on all app.data access; only saveAs needs it.')\n"
+        "    if (not _data_ok) and doc.isSaved:\n"
+        "        # Fall back to the path that DOES work: version the open doc.\n"
+        "        doc.save('saved via MCP (app.data unavailable - fallback)')\n"
+        "        print('FALLBACK: saved a new VERSION of the already-saved '\n"
+        "              'document via doc.save().')\n"
+        "        print('  document: ' + doc.name)\n"
+        "        print('  NOTE: could not create a new lineage - saveAs needs '\n"
+        "              'app.data. To start a separate design, create the new '\n"
+        "              'document in the Fusion UI first.')\n"
+        "    elif not _data_ok:\n"
+        "        print('ERROR: document is unsaved AND app.data is unavailable, '\n"
+        "              'so no lineage can be created. Save once manually in the '\n"
+        "              'Fusion UI, then this tool can version it.')\n"
+        "    elif create_new:\n"
         "        if not name:\n"
         "            print('ERROR: create_new=True requires a name')\n"
         "        else:\n"
@@ -1370,6 +1563,10 @@ def list_recent_designs(limit: int = 15) -> str:
         "    print('\\n'.join(lines) if lines else 'no designs in active project root')\n"
         "except Exception as _e:\n"
         "    print('ERROR: ' + str(_e))\n"
+        "    print('NOTE: this build can raise InternalValidationError on ALL '\n"
+        "          'app.data access, which disables list/open/saveAs for the '\n"
+        "          'whole session. Versioning an already-open document still '\n"
+        "          'works via save_document.')\n"
     ).format(lim=limit)
     return _send(code)
 
@@ -1422,7 +1619,7 @@ def open_document(design_id: str) -> str:
     save_document act on THIS document. Confirm with get_state() afterward."""
     code = (
         "try:\n"
-        "    df = app.data.findFileById('{did}')\n"
+        "    df = app.data.findFileById({did!r})\n"
         "    if df is None:\n"
         "        print('ERROR: no design with that id')\n"
         "    else:\n"
@@ -1432,6 +1629,541 @@ def open_document(design_id: str) -> str:
         "except Exception as _e:\n"
         "    print('ERROR opening: ' + str(_e))\n"
     ).format(did=design_id)
+    return _send(code)
+
+
+# ==========================================================================
+# CURVED-SURFACE FEATURES (wrap / emboss / project)
+# ==========================================================================
+@mcp.tool()
+def wrap_cut(sketch_index: int = -1, depth_mm: float = 1.0,
+             face_tempids: str = "", protrude: bool = False,
+             component_name: str = "") -> str:
+    """Wrap a flat sketch onto a NON-PLANAR face and cut (or emboss) to depth -
+    the primitive for Voronoi / text / texture patterns on curved & revolved
+    bodies. Do NOT hand-roll this: closed splines on curved faces,
+    createRuledSurface, loft between non-planar closed splines and
+    BRepBodyDefinition are all unreliable on this build.
+
+    sketch_index: -1 = most recent sketch. depth_mm: cut depth (protrude=True
+    embosses outward instead). face_tempids: comma-separated ids from
+    list_faces; OMIT to auto-target the largest curved face (recommended -
+    tempIds die when an operation splits faces).
+
+    Cuts PER-PROFILE with an individual volume check and reports ok/no-op/failed
+    counts. A no-op profile usually falls outside the face's angular sector - a
+    single flat sketch only wraps onto roughly one 70-100 degree sector, so
+    split large patterns into sectors.
+    """
+    code = (
+        "design = app.activeProduct\n"
+        "root = design.rootComponent\n"
+        "cn = {cn!r}\n"
+        "host = root\n"
+        "if cn:\n"
+        "    for occ in root.allOccurrences:\n"
+        "        if occ.component.name == cn:\n"
+        "            host = occ.component\n"
+        "            break\n"
+        "if host.sketches.count == 0:\n"
+        "    print('ERROR: no sketches to wrap')\n"
+        "else:\n"
+        "    si = {si}\n"
+        "    sk = host.sketches.item(host.sketches.count - 1 if si < 0 else si)\n"
+        "    ids = {fid!r}\n"
+        "    faces = []\n"
+        "    if ids.strip():\n"
+        "        for b in host.bRepBodies:\n"
+        "            for tok in ids.split(','):\n"
+        "                tok = tok.strip()\n"
+        "                if not tok:\n"
+        "                    continue\n"
+        "                try:\n"
+        "                    f = b.findByTempId(int(tok))\n"
+        "                    if f:\n"
+        "                        faces.extend(list(f) if hasattr(f,'__iter__') else [f])\n"
+        "                except Exception:\n"
+        "                    pass\n"
+        "    if not faces:\n"
+        "        # auto-target: largest NON-planar face (tempIds are unstable)\n"
+        "        best = None\n"
+        "        for b in host.bRepBodies:\n"
+        "            for f in b.faces:\n"
+        "                try:\n"
+        "                    if 'Plane' in type(f.geometry).__name__:\n"
+        "                        continue\n"
+        "                    if best is None or f.area > best.area:\n"
+        "                        best = f\n"
+        "                except Exception:\n"
+        "                    pass\n"
+        "        if best is not None:\n"
+        "            faces = [best]\n"
+        "            print('auto-targeted largest curved face: area=%.2f mm^2' % (best.area*100))\n"
+        "    if not faces:\n"
+        "        print('ERROR: no curved face found to wrap onto')\n"
+        "    else:\n"
+        "        embosses = host.features.embossFeatures\n"
+        "        depth = {d}\n"
+        "        if not {pro}:\n"
+        "            depth = -depth      # NEGATIVE depth cuts, positive protrudes\n"
+        "        ok = 0; noop = 0; failed = 0\n"
+        "        n = sk.profiles.count\n"
+        "        print('wrapping %d profile(s)...' % n)\n"
+        "        for i in range(n):\n"
+        "            prof = sk.profiles.item(i)\n"
+        "            _b = sum((bd.volume if bd.isValid else 0) for bd in host.bRepBodies)\n"
+        "            try:\n"
+        "                # createInput takes EXACTLY 3 positional args:\n"
+        "                # (profiles_list, faces_list, depth_ValueInput)\n"
+        "                ei = embosses.createInput(\n"
+        "                    [prof], faces,\n"
+        "                    adsk.core.ValueInput.createByReal(depth))\n"
+        "                embosses.add(ei)\n"
+        "                _a = sum((bd.volume if bd.isValid else 0) for bd in host.bRepBodies)\n"
+        "                if abs(_a - _b) < 1e-9:\n"
+        "                    noop += 1\n"
+        "                else:\n"
+        "                    ok += 1\n"
+        "            except Exception as _e:\n"
+        "                failed += 1\n"
+        "                if failed <= 3:\n"
+        "                    print('  profile %d failed: %s' % (i, str(_e)[:90]))\n"
+        "        print('wrap_cut done: ok=%d no-op=%d failed=%d' % (ok, noop, failed))\n"
+        "        if noop:\n"
+        "            print('NOTE: no-op profiles almost always fall OUTSIDE the '\n"
+        "                  'face angular sector (~70-100 deg per flat sketch). '\n"
+        "                  'Split the pattern into sectors and wrap each.')\n"
+    ).format(cn=component_name, si=sketch_index, fid=face_tempids,
+             d=depth_mm / 10.0, pro=protrude)
+    return _send(code)
+
+
+@mcp.tool()
+def project_to_surface(sketch_index: int = -1, face_tempid: int = 0,
+                       component_name: str = "") -> str:
+    """Project a sketch's curves onto a face, standalone (no cut). Useful to
+    check where a pattern will actually land before committing to wrap_cut.
+    face_tempid 0 = auto-target the largest curved face."""
+    code = (
+        "design = app.activeProduct\n"
+        "root = design.rootComponent\n"
+        "cn = {cn!r}\n"
+        "host = root\n"
+        "if cn:\n"
+        "    for occ in root.allOccurrences:\n"
+        "        if occ.component.name == cn:\n"
+        "            host = occ.component\n"
+        "            break\n"
+        "sk = host.sketches.item(host.sketches.count - 1 if {si} < 0 else {si})\n"
+        "tid = {tid}\n"
+        "face = None\n"
+        "if tid:\n"
+        "    for b in host.bRepBodies:\n"
+        "        try:\n"
+        "            f = b.findByTempId(tid)\n"
+        "            if f:\n"
+        "                face = f[0] if hasattr(f,'__iter__') else f\n"
+        "                break\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "if face is None:\n"
+        "    best = None\n"
+        "    for b in host.bRepBodies:\n"
+        "        for f in b.faces:\n"
+        "            if 'Plane' in type(f.geometry).__name__:\n"
+        "                continue\n"
+        "            if best is None or f.area > best.area:\n"
+        "                best = f\n"
+        "    face = best\n"
+        "if face is None:\n"
+        "    print('ERROR: no target face')\n"
+        "else:\n"
+        "    cnt = 0\n"
+        "    for c in sk.sketchCurves:\n"
+        "        try:\n"
+        "            sk.projectToSurface([face], c, adsk.fusion.SurfaceProjectTypes.ClosestPointSurfaceProjectType)\n"
+        "            cnt += 1\n"
+        "        except Exception as _e:\n"
+        "            pass\n"
+        "    print('projected %d curve(s) onto face (area=%.2f mm^2)' % (cnt, face.area*100))\n"
+    ).format(cn=component_name, si=sketch_index, tid=face_tempid)
+    return _send(code)
+
+
+@mcp.tool()
+def construction_plane_offset(offset_mm: float, base: str = "xy",
+                              component_name: str = "") -> str:
+    """Create an offset construction plane from a principal plane (xy/xz/yz).
+    Use this INSTEAD of raw ConstructionPlaneInput.setByPlane, which raises
+    'Environment is not supported' on this build. Echoes the plane's world
+    position so a unit slip is visible immediately (setByOffset takes INTERNAL
+    cm - passing mm puts the plane 10x too far and embosses silently no-op)."""
+    code = (
+        "design = app.activeProduct\n"
+        "root = design.rootComponent\n"
+        "cn = {cn!r}\n"
+        "host = root\n"
+        "if cn:\n"
+        "    for occ in root.allOccurrences:\n"
+        "        if occ.component.name == cn:\n"
+        "            host = occ.component\n"
+        "            break\n"
+        "base = {b!r}.lower()\n"
+        "planes = {{'xy': host.xYConstructionPlane,\n"
+        "          'xz': host.xZConstructionPlane,\n"
+        "          'yz': host.yZConstructionPlane}}\n"
+        "bp = planes.get(base, host.xYConstructionPlane)\n"
+        "ci = host.constructionPlanes.createInput()\n"
+        "ci.setByOffset(bp, adsk.core.ValueInput.createByReal({off}))\n"
+        "pl = host.constructionPlanes.add(ci)\n"
+        "g = pl.geometry\n"
+        "print('created offset plane from %s at %.3f mm' % (base, {offmm}))\n"
+        "print('  world origin: (%.3f, %.3f, %.3f) mm' % (g.origin.x*10, g.origin.y*10, g.origin.z*10))\n"
+        "print('  normal: (%.3f, %.3f, %.3f)' % (g.normal.x, g.normal.y, g.normal.z))\n"
+    ).format(cn=component_name, b=base, off=offset_mm / 10.0, offmm=offset_mm)
+    return _send(code)
+
+
+@mcp.tool()
+def construction_plane_tangent(angle_deg: float = 0.0, body_index: int = 0,
+                               component_name: str = "") -> str:
+    """Create a construction plane TANGENT to the largest cylindrical/curved
+    face at a given angle around its axis. This is the reliable way to place
+    sketches for multi-sector wraps (0/90/180/270 deg) on revolved bodies.
+    Echoes world position so unit/orientation slips surface immediately."""
+    code = (
+        "import math\n"
+        "design = app.activeProduct\n"
+        "root = design.rootComponent\n"
+        "cn = {cn!r}\n"
+        "host = root\n"
+        "if cn:\n"
+        "    for occ in root.allOccurrences:\n"
+        "        if occ.component.name == cn:\n"
+        "            host = occ.component\n"
+        "            break\n"
+        "body = host.bRepBodies.item({bi})\n"
+        "best = None\n"
+        "for f in body.faces:\n"
+        "    if 'Cylinder' in type(f.geometry).__name__:\n"
+        "        if best is None or f.area > best.area:\n"
+        "            best = f\n"
+        "if best is None:\n"
+        "    for f in body.faces:\n"
+        "        if 'Plane' not in type(f.geometry).__name__:\n"
+        "            if best is None or f.area > best.area:\n"
+        "                best = f\n"
+        "if best is None:\n"
+        "    print('ERROR: no curved face found')\n"
+        "else:\n"
+        "    bb = body.boundingBox\n"
+        "    cx = (bb.minPoint.x + bb.maxPoint.x) / 2.0\n"
+        "    cy = (bb.minPoint.y + bb.maxPoint.y) / 2.0\n"
+        "    cz = (bb.minPoint.z + bb.maxPoint.z) / 2.0\n"
+        "    r = max(bb.maxPoint.x - cx, bb.maxPoint.y - cy)\n"
+        "    th = math.radians({ang})\n"
+        "    px = cx + r * math.cos(th)\n"
+        "    py = cy + r * math.sin(th)\n"
+        "    sk3 = host.sketches.add(host.xYConstructionPlane)\n"
+        "    pt = sk3.sketchPoints.add(adsk.core.Point3D.create(px, py, cz))\n"
+        "    ci = host.constructionPlanes.createInput()\n"
+        "    try:\n"
+        "        ci.setByTangentAtPoint(best, pt)\n"
+        "        pl = host.constructionPlanes.add(ci)\n"
+        "        g = pl.geometry\n"
+        "        print('tangent plane at %.1f deg' % {ang})\n"
+        "        print('  world origin: (%.3f, %.3f, %.3f) mm' % (g.origin.x*10, g.origin.y*10, g.origin.z*10))\n"
+        "        print('  normal: (%.3f, %.3f, %.3f)' % (g.normal.x, g.normal.y, g.normal.z))\n"
+        "    except Exception as _e:\n"
+        "        print('ERROR creating tangent plane: ' + str(_e))\n"
+    ).format(cn=component_name, bi=body_index, ang=angle_deg)
+    return _send(code)
+
+
+@mcp.tool()
+def sketch_axis_map(sketch_index: int = -1, component_name: str = "") -> str:
+    """Probe a sketch's local->world axis mapping via sketchToModelSpace and
+    report it. Run this BEFORE placing geometry on any offset or tangent plane -
+    local axes rarely match world (e.g. XZ-plane sketch Y maps to world -Z, and
+    an offset plane from YZ maps local +X to world -Z). Prints where local
+    (0,0), (1,0) and (0,1) land in world mm so you can calibrate empirically."""
+    code = (
+        "design = app.activeProduct\n"
+        "root = design.rootComponent\n"
+        "cn = {cn!r}\n"
+        "host = root\n"
+        "if cn:\n"
+        "    for occ in root.allOccurrences:\n"
+        "        if occ.component.name == cn:\n"
+        "            host = occ.component\n"
+        "            break\n"
+        "if host.sketches.count == 0:\n"
+        "    print('ERROR: no sketches')\n"
+        "else:\n"
+        "    si = {si}\n"
+        "    sk = host.sketches.item(host.sketches.count - 1 if si < 0 else si)\n"
+        "    print('sketch: ' + sk.name)\n"
+        "    for label, lx, ly in (('origin (0,0)', 0.0, 0.0),\n"
+        "                          ('local +X (1,0)', 1.0, 0.0),\n"
+        "                          ('local +Y (0,1)', 0.0, 1.0)):\n"
+        "        p = sk.sketchToModelSpace(adsk.core.Point3D.create(lx, ly, 0))\n"
+        "        print('  %-16s -> world (%8.3f, %8.3f, %8.3f) mm'\n"
+        "              % (label, p.x*10, p.y*10, p.z*10))\n"
+        "    o = sk.sketchToModelSpace(adsk.core.Point3D.create(0,0,0))\n"
+        "    xv = sk.sketchToModelSpace(adsk.core.Point3D.create(1,0,0))\n"
+        "    yv = sk.sketchToModelSpace(adsk.core.Point3D.create(0,1,0))\n"
+        "    def axis_of(a, b):\n"
+        "        d = (b.x-a.x, b.y-a.y, b.z-a.z)\n"
+        "        names = ('X','Y','Z')\n"
+        "        i = max(range(3), key=lambda k: abs(d[k]))\n"
+        "        return ('+' if d[i] >= 0 else '-') + names[i]\n"
+        "    print('  MAPPING: local +X -> world %s ; local +Y -> world %s'\n"
+        "          % (axis_of(o, xv), axis_of(o, yv)))\n"
+    ).format(cn=component_name, si=sketch_index)
+    return _send(code)
+
+
+@mcp.tool()
+def cut_prisms(prisms: str, body_index: int = 0, component_name: str = "") -> str:
+    """Cut MANY rectangular prisms out of a body in ONE timeline feature using
+    TemporaryBRepManager. Far more robust than repeated sketch+extrude cuts: it
+    needs no construction planes and no face tempIds (both of which are fragile
+    here), and it survives face-splitting because nothing is re-selected.
+    Hundreds of cuts complete in one operation.
+
+    prisms: JSON list of cutters, each
+      {"x":mm,"y":mm,"z":mm,"w":mm,"d":mm,"h":mm}
+    where x/y/z is the CENTER and w/d/h are full sizes along X/Y/Z.
+    Example: '[{"x":0,"y":0,"z":5,"w":4,"d":4,"h":20}]'
+
+    Reports volume delta and warns on a no-op.
+    """
+    import json as _json
+    try:
+        items = _json.loads(prisms)
+        if not isinstance(items, list) or not items:
+            return "ERROR: prisms must be a non-empty JSON list"
+    except Exception as e:
+        return "ERROR: could not parse prisms JSON: {}".format(e)
+    # normalise to cm on the server side; pass as a plain numeric literal list
+    cutters = []
+    for p in items:
+        try:
+            cutters.append((float(p["x"]) / 10.0, float(p["y"]) / 10.0,
+                            float(p["z"]) / 10.0, float(p["w"]) / 10.0,
+                            float(p["d"]) / 10.0, float(p["h"]) / 10.0))
+        except Exception as e:
+            return "ERROR: bad prism entry {!r}: {}".format(p, e)
+
+    code = (
+        "design = app.activeProduct\n"
+        "root = design.rootComponent\n"
+        "cn = {cn!r}\n"
+        "host = root\n"
+        "if cn:\n"
+        "    for occ in root.allOccurrences:\n"
+        "        if occ.component.name == cn:\n"
+        "            host = occ.component\n"
+        "            break\n"
+        "body = host.bRepBodies.item({bi})\n"
+        "_before = body.volume if body.isValid else 0\n"
+        "CUTTERS = {cut!r}\n"
+        "tbm = adsk.fusion.TemporaryBRepManager.get()\n"
+        "tool = None\n"
+        "made = 0\n"
+        "for (x, y, z, w, d, h) in CUTTERS:\n"
+        "    try:\n"
+        "        obb = adsk.core.OrientedBoundingBox3D.create(\n"
+        "            adsk.core.Point3D.create(x, y, z),\n"
+        "            adsk.core.Vector3D.create(1, 0, 0),\n"
+        "            adsk.core.Vector3D.create(0, 1, 0),\n"
+        "            w, d, h)\n"
+        "        blk = tbm.createBox(obb)\n"
+        "        if tool is None:\n"
+        "            tool = blk\n"
+        "        else:\n"
+        "            tbm.booleanOperation(tool, blk,\n"
+        "                adsk.fusion.BooleanTypes.UnionBooleanType)\n"
+        "        made += 1\n"
+        "    except Exception as _e:\n"
+        "        print('  cutter failed: ' + str(_e)[:80])\n"
+        "if tool is None:\n"
+        "    print('ERROR: no cutter bodies built')\n"
+        "else:\n"
+        "    print('built %d cutter prism(s) as one temp tool body' % made)\n"
+        "    bf = host.features.baseFeatures.add()\n"
+        "    bf.startEdit()\n"
+        "    tool_body = host.bRepBodies.add(tool, bf)\n"
+        "    _tname = tool_body.name\n"
+        "    bf.finishEdit()\n"
+        "    # The handle from bRepBodies.add() is STALE after finishEdit():\n"
+        "    # reusing it raises ALL_TOOL_BODY_REFERENCE_LOST. Re-fetch by name.\n"
+        "    tool_body = None\n"
+        "    for _b in host.bRepBodies:\n"
+        "        if _b.name == _tname:\n"
+        "            tool_body = _b\n"
+        "            break\n"
+        "    if tool_body is None:\n"
+        "        print('ERROR: could not re-fetch tool body %r after finishEdit'\n"
+        "              % _tname)\n"
+        "        raise RuntimeError('tool body reference lost')\n"
+        "    combines = host.features.combineFeatures\n"
+        "    tools_col = adsk.core.ObjectCollection.create()\n"
+        "    tools_col.add(tool_body)\n"
+        "    ci = combines.createInput(body, tools_col)\n"
+        "    ci.operation = adsk.fusion.FeatureOperations.CutFeatureOperation\n"
+        "    ci.isKeepToolBodies = False\n"
+        "    combines.add(ci)\n"
+        "    _b2 = host.bRepBodies.item({bi})\n"
+        "    _after = _b2.volume if _b2.isValid else 0\n"
+        "    _delta = _after - _before\n"
+        "    print('cut_prisms done | volume delta: %+.4f cm^3 (%+.1f mm^3)'\n"
+        "          % (_delta, _delta * 1000.0))\n"
+        "    if abs(_delta) < 1e-9:\n"
+        "        print('WARNING: volume delta ~ZERO - cutters may not intersect '\n"
+        "              'the body (check coordinates and units).')\n"
+    ).format(cn=component_name, bi=body_index, cut=cutters)
+    return _send(code)
+
+
+# ==========================================================================
+# FILLET DIAGNOSIS
+# ==========================================================================
+_ASM_HINTS = {
+    "ASM_BL_END_TOO_CMPLX":
+        "the blend has no run-out at the edge ends. Try isTangentChain=True, or "
+        "include the adjacent edges so the blend has somewhere to terminate.",
+    "ASM_ABL_CAP_COMPLEX":
+        "the blend cap geometry is too complex where edges meet. Reduce the "
+        "radius, or fillet the meeting edges in a separate later feature.",
+    "ASM_BL_CAP_COMPLEX":
+        "same as ABL_CAP_COMPLEX: the end cap cannot be built. Smaller radius, "
+        "or split the edge set.",
+    "ASM_ABL_NO_GEOM_EE":
+        "no valid blend surface exists for this edge/edge combination - usually "
+        "the radius exceeds the available face width. Step the radius down.",
+    "ASM_BL_UNFIN_SHEET":
+        "the blend left an unfinished sheet - the surrounding faces cannot heal. "
+        "Try tangent chaining, or fillet a shorter sub-chain.",
+    "ALL_TOOL_BODY_REFERENCE_LOST":
+        "a body handle went stale (typical after BaseFeature.finishEdit). "
+        "Re-fetch the body from root.bRepBodies by name before reusing it.",
+}
+
+
+@mcp.tool()
+def explain_fillet_error(message: str) -> str:
+    """Translate a raw ACIS/ASM fillet error into an actionable cause. Fusion
+    surfaces codes like ASM_BL_END_TOO_CMPLX with no guidance; this maps the
+    common ones to what actually fixes them."""
+    hits = [(k, v) for k, v in _ASM_HINTS.items() if k in (message or "")]
+    if not hits:
+        return ("No known ASM code found in that message. General fillet ladder: "
+                "(1) try isTangentChain=True - a blend with no run-out at its "
+                "ends often succeeds immediately once chained; (2) step the "
+                "radius down; (3) include adjacent edges; (4) fillet sub-chains "
+                "separately. Always verify the volume delta afterwards - a "
+                "chained fillet can succeed AND silently propagate.")
+    return "\n".join("{}\n  -> {}".format(k, v) for k, v in hits)
+
+
+@mcp.tool()
+def fillet_edges_smart(radius_mm: float, body_index: int = 0,
+                       which: str = "all", min_radius_mm: float = 0.2) -> str:
+    """Fillet that SEARCHES for a working configuration instead of failing.
+
+    For each radius (starting at radius_mm, halving down to min_radius_mm) it
+    tries tangent-chain ON then OFF, and for each attempt verifies the volume
+    delta against the ~0.1*r^2*L expectation. Reports which combination worked
+    and whether the result is geometrically sane.
+
+    This exists because a blend that fails at every constant radius, every
+    variable radius, and as a chamfer can succeed on the FIRST radius once
+    isTangentChain=True gives it a run-out - but tangent chaining is
+    double-edged: it also lets a blend propagate down a tangent-continuous
+    surface and fill in geometry far away. So this verifies rather than just
+    trying."""
+    R0 = radius_mm / 10.0
+    RMIN = min_radius_mm / 10.0
+    code = (
+        "design = app.activeProduct\n"
+        "root = design.rootComponent\n"
+        "body = root.bRepBodies.item({bi})\n"
+        "maxz = body.boundingBox.maxPoint.z\n"
+        "def pick_edges():\n"
+        "    col = adsk.core.ObjectCollection.create()\n"
+        "    L = 0.0\n"
+        "    b = root.bRepBodies.item({bi})\n"
+        "    for e in b.edges:\n"
+        "        sp = e.startVertex.geometry\n"
+        "        ep = e.endVertex.geometry\n"
+        "        vert = abs(sp.z - ep.z) > 1e-6\n"
+        "        top = (abs(sp.z - maxz) < 1e-6) and (abs(ep.z - maxz) < 1e-6)\n"
+        "        _sel = {w!r}\n"
+        "        take = (_sel == 'all') or (_sel == 'vertical' and vert) or (_sel == 'top' and top)\n"
+        "        if take:\n"
+        "            col.add(e)\n"
+        "            try:\n"
+        "                L += e.length * 10.0\n"
+        "            except Exception:\n"
+        "                pass\n"
+        "    return col, L\n"
+        "r = {R0}\n"
+        "rmin = {RMIN}\n"
+        "attempt = 0\n"
+        "solved = None\n"
+        "while r >= rmin and solved is None:\n"
+        "    for chain in (True, False):\n"
+        "        attempt += 1\n"
+        "        edges, Lmm = pick_edges()\n"
+        "        if edges.count == 0:\n"
+        "            print('no edges matched which={w}')\n"
+        "            break\n"
+        "        vol_before = sum((b.volume if b.isValid else 0)\n"
+        "                         for b in root.bRepBodies)\n"
+        "        marker = design.timeline.markerPosition\n"
+        "        try:\n"
+        "            fil = root.features.filletFeatures\n"
+        "            inp = fil.createInput()\n"
+        "            inp.isRollingBallCorner = True\n"
+        "            inp.addConstantRadiusEdgeSet(\n"
+        "                edges, adsk.core.ValueInput.createByReal(r), chain)\n"
+        "            fil.add(inp)\n"
+        "            vol_after = sum((b.volume if b.isValid else 0)\n"
+        "                            for b in root.bRepBodies)\n"
+        "            delta_mm3 = abs(vol_after - vol_before) * 1000.0\n"
+        "            exp_mm3 = 0.1 * ((r*10.0) ** 2) * Lmm\n"
+        "            sane = not (exp_mm3 > 0 and delta_mm3 > 10.0 * exp_mm3)\n"
+        "            print('attempt %d: r=%.2fmm chain=%s -> SUCCESS, '\n"
+        "                  'delta %.2f mm^3 (expect <= ~%.2f) %s'\n"
+        "                  % (attempt, r*10, chain, delta_mm3, exp_mm3,\n"
+        "                     'SANE' if sane else '*** OVERSHOOT ***'))\n"
+        "            if sane:\n"
+        "                solved = (r*10, chain, delta_mm3)\n"
+        "                break\n"
+        "            else:\n"
+        "                print('  rolling back overshooting fillet')\n"
+        "                cur = design.timeline.markerPosition\n"
+        "                for i in range(cur - 1, marker - 1, -1):\n"
+        "                    try:\n"
+        "                        design.timeline.item(i).entity.deleteMe()\n"
+        "                    except Exception:\n"
+        "                        pass\n"
+        "        except Exception as _e:\n"
+        "            msg = str(_e)\n"
+        "            print('attempt %d: r=%.2fmm chain=%s -> FAILED: %s'\n"
+        "                  % (attempt, r*10, chain, msg[:90]))\n"
+        "    if solved is None:\n"
+        "        r = r / 2.0\n"
+        "if solved:\n"
+        "    print('RESOLVED: radius=%.2fmm tangent_chain=%s (volume delta %.2f mm^3)'\n"
+        "          % solved)\n"
+        "else:\n"
+        "    print('NO WORKING CONFIGURATION down to %.2fmm.' % ({RMIN}*10))\n"
+        "    print('Next: include adjacent edges so the blend has a run-out, or '\n"
+        "          'fillet a shorter sub-chain. Pass the raw error to '\n"
+        "          'explain_fillet_error() for a code-specific hint.')\n"
+    ).format(bi=body_index, w=which, R0=R0, RMIN=RMIN)
     return _send(code)
 
 

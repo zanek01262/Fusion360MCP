@@ -44,6 +44,14 @@ LONG OPERATIONS & HANGS
   channel). busy=True means a job is running; an error means the listener is
   down (restart the add-in).
 
+REPLACING A BODY / STARTING OVER
+- Do NOT reach for clear_document to start over. The safe idiom is: build the
+  new body, then retire the old one with retire_body(old) (removeFeatures).
+  It keeps history and cannot destroy unrelated work.
+- clear_document is now reverse-order timeline deletion and runs in the
+  background by default (returns a job_id - poll job_status). The old bulk
+  approach could hang for 10+ minutes and take Fusion down with it.
+
 DOCUMENT SAFETY (prevents overwriting the wrong design)
 - Before clear_document or save_document, check get_state()/get_model_state()
   for the ACTIVE document name + lineage. open_document changes which document
@@ -91,6 +99,28 @@ PERSISTENCE
   versions as you iterate. Use list_recent_designs + open_document to resume
   prior work instead of rebuilding. Confirm the intended Fusion project is
   active before a named save.
+
+CURVED SURFACES & MANY-CUT PATTERNS
+- For a pattern/text/texture that must CONFORM to a curved or revolved face,
+  use wrap_cut. Do NOT hand-roll it: closed splines on curved faces,
+  createRuledSurface, loft between non-planar closed splines and
+  BRepBodyDefinition are all unreliable here.
+- OMIT face_tempids so wrap_cut auto-targets the largest curved face. tempIds
+  die when an operation splits faces; do not cache them across calls.
+- wrap_cut reports ok/no-op/failed per profile. READ THOSE COUNTS. A no-op
+  profile almost always fell outside the face's angular sector - one flat sketch
+  wraps onto only ~70-100 degrees. Split big patterns into sectors at 0/90/180/
+  270 deg using construction_plane_tangent, and wrap each sector separately.
+- Before placing geometry on any offset or tangent plane, run sketch_axis_map -
+  local axes rarely match world, and guessing costs a rebuild.
+- Use construction_plane_offset / construction_plane_tangent instead of raw
+  ConstructionPlaneInput.setByPlane and ConstructionPoints.add, both of which
+  raise "Environment is not supported" on this build.
+- For CELL/LATTICE patterns (many prism cuts), prefer cut_prisms over wrap_cut:
+  it uses TemporaryBRepManager, needs no construction planes and no face
+  tempIds, and lands hundreds of cuts as ONE timeline feature. In raw code the
+  same path is available via the injected tbm() and commit_tool_body() helpers -
+  build throwaway solids in memory, boolean them, commit one result.
 
 WHEN TO USE RAW CODE
 - The canned tools cover boxes, cylinders, holes, fillets, shells, tapped holes,

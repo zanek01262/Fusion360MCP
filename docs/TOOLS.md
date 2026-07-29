@@ -1,5 +1,9 @@
 # TOOLS.md — Fusion 360 MCP tool reference
 
+**Argument safety:** all arguments are emitted as proper Python literals, so
+Windows paths (`C:\\parts\\x.step`), apostrophes, and quotes are handled
+correctly and cannot alter the code that runs inside Fusion.
+
 **Unit rule:** every argument is in **millimeters**. Internally tools convert
 to Fusion's centimeters. When you (or Claude) write raw code, the API is in cm.
 
@@ -58,7 +62,16 @@ no import needed):
 - `total_volume()` — summed cm³ of all bodies; capture **before** a boolean.
 - `report_volume_delta(before, label)` — print the change and **scream if ~0**
   (silent no-op boolean).
-- `sliver_face_count(body)` — count sub-threshold faces (bad-boolean slivers).
+- `capture_state(target_body)` / `report_volume_delta(before, label, target_body)` —
+  the correct before/after pair. Tracks body count **and** the target body's own
+  volume, so a volume-neutral **Join** is no longer flagged as a false no-op.
+- `fillet_volume_sanity(r_mm, edge_len_mm, delta_cm3)` — catches a fillet that
+  propagated beyond its edges.
+- `sliver_face_count(body, min_area_mm2=0.05)` — threshold raised; prefer
+  `smallest_faces(body, n=5)`, which prints the actual smallest areas.
+- `P_xy(x,y)` / `P_xz(x,z)` / `P_yz(y,z)` — world mm → correct sketch point.
+- `verify_plane_mapping(sketch)` — print a plane's measured local→world basis.
+- `retire_body(body)` — the safe replace-a-body idiom.
 - `log_sketch_areas(sketch)` — print each profile area in mm² (catches scale slips).
 - `delete_face(face)` — delete one face the way Fusion accepts (`DeleteFaceFeatures`).
 
@@ -155,14 +168,30 @@ introspection; makes crash recovery a one-call operation.
 True centroid-to-centroid distance (mm) between two oriented faces. Use to
 verify wall thickness, overall size, gaps — more trustworthy than the bbox.
 
-### `cross_section(body_index=0, axis="z", at_mm=None, span_axis="x", samples=41)`
+### `cross_section(body_index=0, axis="z", at_mm=None, span_axis="x", samples=41, at_a_mm=None, at_b_mm=None)`
 Scan a line of points through a body and report solid/void as an **ASCII row**
 (`#`=solid, `.`=void) plus the **mm coordinates of every solid/void boundary**.
 The best non-visual diagnostic for trapped voids, missed cuts, and wall
 thickness. Holds the two non-span axes at their mid-value (or at `at_mm` along
-`axis`) and sweeps `span_axis` across the bbox.
+`axis`) and sweeps `span_axis` across the bbox. **Pin the held axes explicitly**
+with `at_a_mm` / `at_b_mm` to scan through a specific feature — e.g. a vent tube
+at x=3.8: `cross_section(span_axis='y', at_a_mm=3.8)`.
 Example: `cross_section(axis="z", at_mm=10, span_axis="x")` → reads off wall
 positions along X at Z=10 mm.
+
+
+### `fillet_edges_smart(radius_mm, body_index=0, which="all", min_radius_mm=0.2)`
+Fillet that **searches** for a working configuration: for each radius (halving
+down to `min_radius_mm`) it tries tangent-chain on then off, verifies the volume
+delta against `~0.1*r^2*L`, rolls back an overshoot, and reports which
+combination worked. Exists because a blend that fails at every constant radius,
+every variable radius, and as a chamfer can succeed on the *first* radius once
+tangent chaining gives it a run-out.
+
+### `explain_fillet_error(message)`
+Translates raw ACIS/ASM codes (`ASM_BL_END_TOO_CMPLX`, `ASM_ABL_CAP_COMPLEX`,
+`ASM_ABL_NO_GEOM_EE`, `ASM_BL_UNFIN_SHEET`, `ALL_TOOL_BODY_REFERENCE_LOST`, …)
+into what actually fixes them.
 
 ### `list_faces(body_index=0, max_faces=40)`
 Faces with a stable **tempId**, centroid (mm), area (mm²), surface type, largest
@@ -177,9 +206,11 @@ the tempId to target specific edges for fillets/chamfers in raw code.
 
 ## Visual feedback
 
-### `view_model(orientation="iso")`
-Orient (iso/top/front/back/right/left), fit, screenshot, and **return the
-image** so Claude sees it. Call after non-trivial operations to verify.
+### `view_model(orientation="iso", zoom_x_mm=None, zoom_y_mm=None, zoom_z_mm=None, zoom_radius_mm=None)`
+Orient (iso/top/**bottom**/front/back/right/left), fit, screenshot, and
+**return the image**. An unrecognised orientation is an **ERROR**, not a silent
+fallback to iso. Pass `zoom_*_mm` + `zoom_radius_mm` to frame a small detail —
+inspecting a 4 mm feature on a 76 mm part is impossible with a whole-model fit.
 
 ### `set_view(orientation="iso")`
 Reposition the camera without returning an image.
@@ -291,6 +322,185 @@ geometry) → `ground_component` base → `move_component` others →
 
 **Resume later:** `list_recent_designs` → `open_document(id)` → modify →
 `save_document` (new version).
+
+---
+
+## Curved-surface features (wrap / emboss / project)
+
+> These exist because every hand-rolled alternative is unreliable on this build:
+> closed splines on curved faces, `createRuledSurface`, loft between non-planar
+> closed splines, and `BRepBodyDefinition` all fail. Use these tools instead.
+
+### `wrap_cut(sketch_index=-1, depth_mm=1.0, face_tempids="", protrude=False, component_name="")`
+Wrap a flat sketch onto a **non-planar** face and cut to depth (`protrude=True`
+embosses outward). The primitive for Voronoi / text / texture on curved and
+revolved bodies.
+- `sketch_index=-1` uses the most recent sketch.
+- **Omit `face_tempids`** to auto-target the largest curved face — recommended,
+  because tempIds die the moment an operation splits faces.
+- Cuts **per-profile with an individual volume check**, reporting
+  `ok / no-op / failed` counts. Read them.
+- A **no-op profile almost always fell outside the face's angular sector**: one
+  flat sketch only wraps onto roughly a 70–100° sector. Split large patterns
+  into sectors (0/90/180/270°) using `construction_plane_tangent`.
+
+### `project_to_surface(sketch_index=-1, face_tempid=0, component_name="")`
+Project sketch curves onto a face without cutting — use it to see where a
+pattern will actually land before committing to `wrap_cut`.
+
+### `construction_plane_offset(offset_mm, base="xy", component_name="")`
+Offset construction plane from a principal plane. Use this **instead of raw
+`ConstructionPlaneInput.setByPlane`**, which raises "Environment is not
+supported" here. Echoes the plane's world origin/normal so a unit slip is
+visible immediately — `setByOffset` takes **internal cm**, so passing mm places
+the plane 10× too far and makes subsequent embosses silently no-op.
+
+### `construction_plane_tangent(angle_deg=0.0, body_index=0, component_name="")`
+Plane tangent to the largest curved face at an angle around its axis. The
+reliable way to place sketches for **multi-sector wraps** on revolved bodies.
+Echoes world position/normal.
+
+### `sketch_axis_map(sketch_index=-1, component_name="")`
+Probe a sketch's local→world mapping via `sketchToModelSpace` and print where
+local (0,0), (1,0), (0,1) land in world mm, plus a plain-language summary
+(`local +X -> world -Z`). **Run this before placing geometry on any offset or
+tangent plane** — local axes rarely match world.
+
+---
+
+## TemporaryBRepManager — the robust path for many cuts
+
+### `cut_prisms(prisms, body_index=0, component_name="")`
+Cut **many rectangular prisms in ONE timeline feature** using
+`TemporaryBRepManager`. This is usually a better investment than `wrap_cut` for
+cell/lattice patterns because it depends on **neither construction planes nor
+face tempIds** — the two most fragile things in this environment — and nothing
+is re-selected, so it survives face-splitting.
+
+`prisms` is a JSON list, each entry a centre plus full sizes in mm:
+```json
+[{"x":0,"y":0,"z":5,"w":4,"d":4,"h":20}]
+```
+Reports volume delta and warns on a no-op. Hundreds of cutters complete as a
+single operation.
+
+### Rolling your own with `tbm()`
+Two helpers are injected into every raw-code namespace:
+
+- **`tbm()`** → `TemporaryBRepManager`. Build throwaway solids in memory,
+  boolean them together, commit one result.
+- **`commit_tool_body(tool_temp, target_body, keep_tool=False)`** → lands a temp
+  solid in the design and cuts it from `target_body` in one combine feature,
+  printing the volume delta and warning on ~zero.
+
+```python
+t = tbm()
+obb = adsk.core.OrientedBoundingBox3D.create(
+    adsk.core.Point3D.create(mm(0), mm(0), mm(5)),
+    adsk.core.Vector3D.create(1,0,0), adsk.core.Vector3D.create(0,1,0),
+    mm(4), mm(4), mm(20))
+tool = t.createBox(obb)
+# union more cutters into `tool` ...
+commit_tool_body(tool, root.bRepBodies.item(0))
+```
+
+Why it wins here: no construction planes (`setByPlane` and
+`ConstructionPoints.add` are environment-blocked), no tempId re-selection, and
+one timeline feature instead of N.
+
+---
+
+## API traps on this build (measured, not guessed)
+
+Each of these cost real debugging time. They fail **quietly** — valid bodies,
+success messages, plausible bounding boxes — so they're worth reading once.
+
+### Sketch-plane mapping: the YZ plane is not what you'd expect
+Measured with `sketchToModelSpace`:
+
+| Plane | Mapping | Helper |
+|-------|---------|--------|
+| XY | `sketch(u,v) -> world(u, v, 0)` | `P_xy(x,y)` |
+| XZ | `sketch(u,v) -> world(u, 0, -v)` | `P_xz(x,z)` |
+| YZ | `sketch(u,v) -> world(0, v, -u)` | `P_yz(y,z)` |
+
+The YZ row is **sketch X → world −Z, sketch Y → world +Y** — *not* the
+"sketch X → world Y, sketch Y → world Z" that earlier docs claimed. A wrong
+mapping produces a body with a correct bounding box and a correct profile area
+that only reveals itself several operations later.
+
+**Don't reason about it — use `P_xy` / `P_xz` / `P_yz`** (they take world mm and
+return the right sketch point), and call `verify_plane_mapping(sketch)` once on
+any new, offset, or tangent plane to print its measured basis.
+
+### `TimelineObject` has no `deleteMe`
+Use `tl.item(i).entity.deleteMe()`. The TimelineObject exposes only
+`entity, rollTo, reorder, isSuppressed, healthState`.
+
+### Bodies added via `BaseFeature` return a STALE reference
+```python
+bf = root.features.baseFeatures.add()
+bf.startEdit()
+body = root.bRepBodies.add(tempBody, bf)
+name = body.name
+bf.finishEdit()
+# `body` is now unusable -> RuntimeError: ALL_TOOL_BODY_REFERENCE_LOST
+body = next(b for b in root.bRepBodies if b.name == name)   # re-fetch
+```
+Renaming through the stale handle also silently doesn't stick. `cut_prisms` and
+`commit_tool_body()` handle this internally.
+
+### Sketch entity properties return fresh wrappers — `is` is a trap
+```python
+arc.startSketchPoint is arc.startSketchPoint   # False!
+```
+Using `is` to pick which end of an arc to connect to silently selects the same
+point twice, giving an ambiguous chain and a sweep that produces a fraction of
+the expected volume with no error. Compare `.geometry` coordinates instead, and
+**print `path.count`** after `Path.create` — a mis-chain is invisible otherwise.
+
+### `addByCenterStartSweep` normalizes start/end
+With a negative sweep angle, `startSketchPoint` comes back as the geometric
+*end* of what you asked for. Prefer `addByThreePoints` with explicitly computed
+points.
+
+### `setMidRadii` takes Python lists, not `ObjectCollection`
+```python
+vs.setMidRadii([ValueInput.createByReal(mm(0.5))],
+               [ValueInput.createByReal(0.5)])
+```
+Passing ObjectCollections gives a raw SWIG error with no hint.
+
+### `app.data` can fail for an entire session
+`InternalValidationError : group` on `app.data.activeProject` disables
+`list_recent_designs`, `open_document`, and any `saveAs`. It can persist across a
+Fusion restart. `save_document` now detects this and falls back to
+`doc.save()` — which works on an already-saved document — and tells you a new
+lineage can't be created. Create the new document in the Fusion UI first.
+
+### Fillets can destroy geometry silently
+A tangent-chained fillet can propagate down a tangent-continuous surface and
+fill in a relief tens of mm away, reverting a bore radius, while reporting
+success with a valid body and no slivers. `fillet_edges` now checks the volume
+delta against `~0.1*r^2*L` and warns on an order-of-magnitude overshoot; the
+same check is available as `fillet_volume_sanity()` in raw code. `isTangentChain`
+is genuinely double-edged — it also *rescues* blends that have no run-out — so
+**verify, don't just try**: that's what `fillet_edges_smart` does.
+
+---
+
+## Replacing a body (recommended over clearing)
+
+Don't reach for `clear_document` to start over. The safer idiom keeps history and
+can't destroy unrelated work:
+
+```python
+# build the new body first, then retire the old one
+retire_body(old_body)      # -> root.features.removeFeatures.add(old_body)
+```
+
+`retire_body()` is injected into every raw-code namespace. `clear_document` is
+still available (now reverse-order and async), but replacement is strictly safer.
 
 ---
 

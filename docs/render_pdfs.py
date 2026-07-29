@@ -55,7 +55,7 @@ strong { color: #0a0a0a; }
   border-bottom: 2px solid #d0d7de; }
 """
 
-VERSION = "1.2.1"
+VERSION = "1.4.1"
 HEADER = ('<div class="title-block"><div style="font-size:9pt;color:#0d3b66;'
           'font-weight:600;letter-spacing:1px;">FUSION 360 MCP &middot; v'
           + VERSION + '</div></div>')

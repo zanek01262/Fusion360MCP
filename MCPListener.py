@@ -33,7 +33,7 @@ import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8765
-LISTENER_VERSION = '1.2.1'
+LISTENER_VERSION = '1.4.1'
 PROTOCOL = 2   # bump when the wire schema changes
 CUSTOM_EVENT_ID = 'MCPListenerExec'
 DEFAULT_BUDGET_S = 600.0   # soft budget; job is FLAGGED timeout past this
@@ -149,7 +149,25 @@ def volume_of(body):
     except Exception:
         return 0.0
 
-def sliver_face_count(body, min_area_mm2=0.01):
+def smallest_faces(body, n=5):
+    """Print the n smallest face areas in mm^2. Far more informative than a
+    sliver COUNT - you see whether the smallest face is 0.01 mm^2 (an artifact)
+    or 4 mm^2 (fine)."""
+    areas = []
+    for f in body.faces:
+        try:
+            areas.append(f.area * 100.0)
+        except Exception:
+            pass
+    areas.sort()
+    shown = areas[:n]
+    print('[faces] %d total; %d smallest (mm^2): %s'
+          % (len(areas), len(shown), ', '.join('%.4f' % a for a in shown)))
+    return shown
+
+def sliver_face_count(body, min_area_mm2=0.05):
+    # threshold raised from 0.01: faces of 0.010-0.014 mm^2 are ~0.11 mm across
+    # and DO show as visible artifacts, but slipped under the old cutoff.
     n = 0
     thresh_cm2 = min_area_mm2 / 100.0
     for f in body.faces:
@@ -165,15 +183,78 @@ def total_volume():
     root = d.rootComponent
     return sum(volume_of(b) for b in root.bRepBodies)
 
-def report_volume_delta(before_cm3, label='op'):
-    after = total_volume()
-    delta = after - before_cm3
-    print('[%s] volume delta: %+.4f cm^3 (= %+.1f mm^3)'
-          % (label, delta, delta * 1000.0))
-    if abs(delta) < 1e-7:
-        print('[%s] WARNING: volume delta is ~ZERO - the operation may have had '
-              'NO effect (silent no-op boolean / cut missed the body).' % label)
-    return delta
+def body_count():
+    d = _active_design()
+    return d.rootComponent.bRepBodies.count
+
+def capture_state(target_body=None):
+    """Snapshot before a boolean. Pass the TARGET body when you have one: a
+    Join that merges two existing bodies is volume-neutral overall, so total
+    volume alone produces a FALSE no-op alarm on the most common boolean."""
+    tv = None
+    try:
+        if target_body is not None and target_body.isValid:
+            tv = target_body.volume
+    except Exception:
+        tv = None
+    return {'total': total_volume(), 'count': body_count(), 'target': tv,
+            'name': getattr(target_body, 'name', None)}
+
+def report_volume_delta(before, label='op', target_body=None):
+    """Report what an operation actually changed. `before` may be a
+    capture_state() dict (preferred) or a bare float total. Warns ONLY when
+    body count AND volume are both unchanged - so a volume-neutral Join is
+    correctly reported as a real effect, not a no-op."""
+    after_total = total_volume()
+    after_count = body_count()
+    if isinstance(before, dict):
+        b_total = before.get('total', 0.0)
+        b_count = before.get('count', after_count)
+        b_target = before.get('target')
+        tname = before.get('name')
+    else:
+        b_total, b_count, b_target, tname = float(before), after_count, None, None
+
+    d_total = after_total - b_total
+    d_count = after_count - b_count
+    print('[%s] total volume delta: %+.4f cm^3 (= %+.1f mm^3) | bodies: %d -> %d'
+          % (label, d_total, d_total * 1000.0, b_count, after_count))
+
+    d_target = None
+    if b_target is not None and target_body is not None:
+        try:
+            if target_body.isValid:
+                d_target = target_body.volume - b_target
+                print('[%s] target body %r delta: %+.4f cm^3'
+                      % (label, tname, d_target))
+        except Exception:
+            pass
+
+    tgt_changed = (d_target is not None and abs(d_target) >= 1e-7)
+    changed = (abs(d_total) >= 1e-7) or (d_count != 0) or tgt_changed
+    if not changed:
+        print('[%s] WARNING: nothing changed - volume AND body count are both '
+              'unchanged. The operation had NO effect.' % label)
+    return d_total
+
+def fillet_volume_sanity(radius_mm, edge_len_mm, delta_cm3, label='fillet'):
+    """A fillet of radius r along total edge length L changes volume by at most
+    ~0.1*r^2*L. An order-of-magnitude overshoot means the blend propagated past
+    the intended edges - typically tangent-chaining running down a
+    tangent-continuous surface and filling in a relief far away. Fusion reports
+    SUCCESS, the body stays valid, no sliver appears: this is the only cheap
+    detector."""
+    expected_mm3 = 0.1 * (radius_mm ** 2) * max(edge_len_mm, 0.0)
+    actual_mm3 = abs(delta_cm3) * 1000.0
+    print('[%s] volume delta %.2f mm^3 (expected <= ~%.2f mm^3 for r=%.2f, L=%.1f)'
+          % (label, actual_mm3, expected_mm3, radius_mm, edge_len_mm))
+    if expected_mm3 > 0 and actual_mm3 > 10.0 * expected_mm3:
+        print('[%s] *** WARNING: volume change is %.1fx the expected maximum. '
+              'The fillet almost certainly propagated beyond the intended edges. '
+              'VERIFY with cross_section - Fusion will NOT report this.'
+              % (label, actual_mm3 / expected_mm3))
+        return False
+    return True
 
 def log_sketch_areas(sketch):
     try:
@@ -194,10 +275,126 @@ def delete_face(face):
         print('[delete_face] failed: ' + str(_e))
         return False
 
+def P_xy(x_mm, y_mm):
+    """Sketch point on the XY plane that lands at world (x, y, 0) mm.
+    XY mapping: sketch(u,v) -> world(u, v, 0)."""
+    return adsk.core.Point3D.create(mm(x_mm), mm(y_mm), 0)
+
+def P_xz(x_mm, z_mm):
+    """Sketch point on the XZ plane that lands at world (x, 0, z) mm.
+    MEASURED XZ mapping: sketch(u,v) -> world(u, 0, -v), so sketch Y is the
+    NEGATED world Z."""
+    return adsk.core.Point3D.create(mm(x_mm), mm(-z_mm), 0)
+
+def P_yz(y_mm, z_mm):
+    """Sketch point on the YZ plane that lands at world (0, y, z) mm.
+    MEASURED YZ mapping on this build: sketch(u,v) -> world(0, v, -u).
+    i.e. sketch X -> world -Z and sketch Y -> world +Y. This is NOT the
+    'sketch X -> world Y, sketch Y -> world Z' that older docs claimed - that
+    error produces a plausible-looking body with a correct bounding box and a
+    correct profile area, and only shows up several operations later."""
+    return adsk.core.Point3D.create(mm(-z_mm), mm(y_mm), 0)
+
+def verify_plane_mapping(sketch, label='sketch'):
+    """Measure and print a sketch's ACTUAL local->world basis via
+    sketchToModelSpace. Run this once on any new/offset/tangent plane before
+    placing geometry - a wrong mapping never fails loudly."""
+    o = sketch.sketchToModelSpace(adsk.core.Point3D.create(0, 0, 0))
+    ux = sketch.sketchToModelSpace(adsk.core.Point3D.create(1, 0, 0))
+    uy = sketch.sketchToModelSpace(adsk.core.Point3D.create(0, 1, 0))
+    def axis_of(a, b):
+        d = (b.x - a.x, b.y - a.y, b.z - a.z)
+        names = ('X', 'Y', 'Z')
+        i = max(range(3), key=lambda k: abs(d[k]))
+        return ('+' if d[i] >= 0 else '-') + names[i]
+    print('[%s] origin -> world (%.3f, %.3f, %.3f) mm'
+          % (label, o.x * 10, o.y * 10, o.z * 10))
+    print('[%s] sketch +X -> world %s ; sketch +Y -> world %s'
+          % (label, axis_of(o, ux), axis_of(o, uy)))
+    return (axis_of(o, ux), axis_of(o, uy))
+
+def retire_body(body):
+    """Non-destructively retire a body: root.features.removeFeatures.add(body).
+    This is the RECOMMENDED replace-a-body idiom - it keeps timeline history and
+    is strictly safer than clearing the document. Build the new body first, then
+    retire the old one."""
+    d = _active_design()
+    root = d.rootComponent
+    try:
+        name = body.name
+        root.features.removeFeatures.add(body)
+        print('[retire_body] retired %r (history preserved)' % name)
+        return True
+    except Exception as _e:
+        print('[retire_body] failed: ' + str(_e))
+        return False
+
 def progress(msg):
     """Emit an incremental progress line. Visible via GET /job before the call
     finishes - use it to mark stages of a long operation."""
     print('[progress] ' + str(msg))
+
+def tbm():
+    """TemporaryBRepManager - build throwaway solids in memory, boolean them,
+    then commit ONE result. This is the most robust path on this build: it needs
+    NO construction planes (setByPlane / ConstructionPoints.add raise
+    'Environment is not supported' here) and NO face tempIds (which die when an
+    operation splits faces). Hundreds of cuts land as a single timeline feature.
+
+    Typical pattern:
+        t = tbm()
+        obb = adsk.core.OrientedBoundingBox3D.create(
+            adsk.core.Point3D.create(mm(0), mm(0), mm(5)),
+            adsk.core.Vector3D.create(1,0,0), adsk.core.Vector3D.create(0,1,0),
+            mm(4), mm(4), mm(20))
+        tool = t.createBox(obb)
+        for extra in others:
+            t.booleanOperation(tool, extra,
+                adsk.fusion.BooleanTypes.UnionBooleanType)
+        bf = root.features.baseFeatures.add()
+        bf.startEdit(); tb = root.bRepBodies.add(tool, bf); bf.finishEdit()
+        # then a CombineFeature cut against the target body
+    See the cut_prisms tool for a complete worked implementation."""
+    return adsk.fusion.TemporaryBRepManager.get()
+
+def commit_tool_body(tool_body_temp, target_body, keep_tool=False):
+    """Commit a TemporaryBRepManager solid into the design and CUT it from
+    target_body in one combine feature. Returns the volume delta (and warns if
+    it is ~zero). This is the safe way to land temp-BRep work in the timeline."""
+    d = _active_design()
+    root = d.rootComponent
+    before = target_body.volume if target_body.isValid else 0.0
+    bf = root.features.baseFeatures.add()
+    bf.startEdit()
+    tb = root.bRepBodies.add(tool_body_temp, bf)
+    tb_name = tb.name
+    bf.finishEdit()
+    # The handle returned by bRepBodies.add() is STALE after finishEdit():
+    # using it as a Combine tool raises ALL_TOOL_BODY_REFERENCE_LOST, and
+    # renaming through it silently does not stick. Re-fetch by name.
+    tb = None
+    for b in root.bRepBodies:
+        if b.name == tb_name:
+            tb = b
+            break
+    if tb is None:
+        print('[commit_tool_body] ERROR: could not re-fetch tool body %r'
+              % tb_name)
+        return 0.0
+    combines = root.features.combineFeatures
+    col = adsk.core.ObjectCollection.create()
+    col.add(tb)
+    ci = combines.createInput(target_body, col)
+    ci.operation = adsk.fusion.FeatureOperations.CutFeatureOperation
+    ci.isKeepToolBodies = keep_tool
+    combines.add(ci)
+    after = target_body.volume if target_body.isValid else 0.0
+    delta = after - before
+    print('[commit_tool_body] volume delta: %+.4f cm^3' % delta)
+    if abs(delta) < 1e-9:
+        print('[commit_tool_body] WARNING: ~ZERO delta - the tool body may not '
+              'intersect the target (check coordinates/units).')
+    return delta
 '''
 
 
