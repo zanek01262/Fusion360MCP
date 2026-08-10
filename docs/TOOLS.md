@@ -72,6 +72,11 @@ no import needed):
 - `P_xy(x,y)` / `P_xz(x,z)` / `P_yz(y,z)` — world mm → correct sketch point.
 - `verify_plane_mapping(sketch)` — print a plane's measured local→world basis.
 - `retire_body(body)` — the safe replace-a-body idiom.
+- `edge_ok(e)` / `safe_edges(body)` / `edge_face_pair(e)` — degenerate-edge
+  guards and the surface-type-pair classifier.
+- `path_report(path)` — segment count + total length, so a mis-chained path is
+  visible (a short sweep is otherwise silent).
+- `refresh_geometry()` — force a recompute and report whether volumes moved.
 - `log_sketch_areas(sketch)` — print each profile area in mm² (catches scale slips).
 - `delete_face(face)` — delete one face the way Fusion accepts (`DeleteFaceFeatures`).
 
@@ -274,37 +279,56 @@ in root (or a named component).
 
 ---
 
-## Document persistence
+## Document identity & persistence
 
-Require being signed in with an **active project** in Fusion's Data Panel.
+> **The single most damaging failure class.** Every tool operates on the
+> **active document**, and Claude cannot see the Fusion window. Three things
+> compound: `doc.dataFile` routes through `app.data` (which can be dead for a
+> whole session), the cheap state is a **cache** that goes stale when the user
+> switches documents in the UI, and `isSaved` alone is ambiguous. Together they
+> produce: overwriting the wrong design, starting a new document instead of
+> continuing in the open one, and reporting a save that never happened.
 
-> **Document identity is now surfaced everywhere.** `get_state` and
-> `get_model_state` both lead with the active document's **name + lineage id**,
-> so you can see which document a `clear`/`save`/`open` will affect before acting.
-> This prevents the worst error class — overwriting the wrong design.
+### `document_report()`
+**Run this before any save, clear, or destructive edit.** Authoritative *live*
+read (not the cache) of the active document and **every other open document**:
+name, `isSaved` and `isModified` read independently, lineage id, version number,
+and whether `app.data` was reachable at all.
 
-### `save_document(name="", create_new=False)`
-Save the active doc and **always report which lineage was written**.
-- `create_new=True` → save-as a brand-new document/lineage named `name`. Use for
-  a **new part** so it never lands in an unrelated design's history.
-- `create_new=False` (default) → unsaved doc saves-as `name`; already-saved doc
-  saves a **new version of the current lineage**, printing the name + lineage id
-  it versioned. **Warning:** this versions whatever lineage is open — if you
-  opened part A but meant to save new part B, it buries B in A's history. When in
-  doubt, `create_new=True` or check identity first.
+It ends with an explicit **VERDICT** and — crucially — distinguishes
+*"never saved"* from *"cannot tell"*. When `app.data` is broken the lineage is
+unreadable, and treating that as "unsaved" is precisely what causes a duplicate
+document to be created.
 
-### `list_recent_designs(limit=15)`
-Designs in the active project root, as `name :: id`.
+### `activate_document(name_or_index)`
+Make a specific open document active, by name substring or by the index shown in
+`document_report`. Use it to **bind to the user's document** rather than assuming
+the active one is right.
 
-### `list_versions(design_id="")`
-**Read-only:** enumerate the saved versions of a lineage (version number, id,
-date) so you can confirm what's recoverable after a bad save and point the user
-to the exact version to promote in the Data Panel. Empty `design_id` = active
-document's lineage.
+### `save_document(name="", create_new=False, force_new_lineage=False)`
+Saves and then **verifies**. Never branches on a single flag:
 
-### `open_document(design_id)`
-Open a design by id. **Changes the active document** — subsequent
-`clear`/`save` act on it. Reports the new lineage; confirm with `get_state()`.
+| Situation | Action |
+|---|---|
+| Lineage readable + present | `doc.save()` — version the **open** document |
+| Lineage readable + absent | `saveAs name` — genuine first save |
+| Lineage **unreadable** | try `doc.save()` **first** (non-destructive; needs no `app.data`). If it fails, **stop** — no silent `saveAs` |
+| `create_new=True` | always `saveAs` — explicit new lineage |
+
+Reports version before/after and prints **CONFIRMED** only when an independent
+signal agrees (version bumped, modified cleared, or a lineage appeared).
+Otherwise it prints **UNCONFIRMED** and says not to report the document as
+saved. `force_new_lineage=True` overrides the guard deliberately.
+
+### `get_state()`
+Cheap cached state, now including **every open document** and its own
+**snapshot age**. If `fresh=False`, the user may have switched documents since —
+use `document_report()` before acting.
+
+### `list_recent_designs(limit=15)` / `open_document(design_id)` / `list_versions(design_id="")`
+All require `app.data`. When it is broken these **cannot be worked around** —
+ask the user to open or save the design in the Fusion UI rather than retrying.
+
 
 ---
 
@@ -410,6 +434,101 @@ one timeline feature instead of N.
 
 ---
 
+## Edge selection & fillet verification
+
+`which=all/vertical/top` cannot express what real fillets need — *"the edges
+between surface type A and B, within a z range, longer than L."* These tools do.
+
+### `select_edges(body_index=0, face_pair="", z_min_mm=None, z_max_mm=None, min_len_mm=None, max_len_mm=None, component_name="")`
+Select edges by predicate; returns a comma-separated **tempId list** ready to
+paste into `fillet_edges_smart(edge_tempids=...)`.
+- `face_pair` — substring match on the adjacent surface-type pair, e.g.
+  `"Cylinder|Cone"`, or just `"Cone"` for any edge touching a cone.
+- `z_min_mm` / `z_max_mm` — edge **midpoint** z range.
+- `min_len_mm` / `max_len_mm` — length range.
+
+`list_edges` now reports the same **surface-type pair** per edge, so you don't
+have to re-implement the classifier.
+
+### `fillet_preview(radius_mm, edge_tempids, body_index=0)`
+What a fillet *would* touch, before committing: selected edges, adjacent faces,
+and any face smaller than **~4r²** — the signature of a radius too large for the
+feature it lands on, which is how a fillet silently **consumes** a narrow
+feature (a 1.3 mm rim annulus, say) while the volume delta still looks fine.
+
+### `fillet_edges_smart(radius_mm, body_index=0, which="all", min_radius_mm=0.2, edge_tempids="")`
+Searches radius × tangent-chain and verifies **two** ways:
+- **Volume** — delta vs `~0.1·r²·L`, catching a blend that propagated and *added*
+  geometry far away.
+- **Topology** — which faces *disappeared*, warning when a face smaller than
+  `4r²` was consumed. This is the opposite failure and volume checks miss it
+  entirely.
+
+Overshoots are rolled back and the search continues. **A zero delta at every
+radius is reported as a RESULT, not a failure** — it means the surfaces already
+meet tangentially and need no fillet, which is real design information.
+
+### `force_delete_feature(feature_name)`
+Escape hatch for a **mutual-reference deadlock** — two features each reporting
+the other as the blocking failure, where neither suppress nor `deleteMe()` works
+in either order. Does what the Fusion UI does: rolls the timeline marker to just
+*before* the feature, deletes it there, rolls forward, and reports what else
+became unhealthy.
+
+---
+
+## Sweeps and splines
+
+### `sweep_tube_check(path_sketch_index=-1, tube_radius_mm=1.0, samples=60, component_name="")`
+Check a sweep **path** before sweeping. `ASM_SELF_INTER` on a circular-profile
+sweep blames the profile or taper angle, but the cause is almost always the
+path: if its minimum curvature radius is below the tube radius, the swept body
+self-intersects. Reports minimum curvature radius, where it occurs, and total
+path length.
+
+### `respline(points_json, sketch_index=-1, curve_index=0, plane="xy", component_name="")`
+Rebuild a fitted spline with a **new** set of fit points — Fusion lets you move
+existing fit points but not add one. Points are given in **world mm** and mapped
+onto the chosen plane using the measured mappings.
+**Limitation, stated honestly:** recreating a curve *breaks* downstream
+references; Fusion has no true in-place respline. The tool reports every
+feature that became unhealthy so you can see the repair surface.
+
+---
+
+## Batching
+
+`run_batch(operations_json, stop_on_error=True)` fuses several operations into
+ONE round trip and one Fusion job. Only **geometry and parameter** tools are
+batchable (an explicit allowlist). Reporting, async and document-level tools —
+`clear_document`, `save_document`, `view_model`, `document_report`, … — must be
+called directly so their results and safety checks are not swallowed. An invalid
+batch is rejected before anything executes.
+
+## Verification guarantees (what "success" means)
+
+The most expensive failures in this project were **silent wrong-target** and
+**unverified success** — a tool reporting that it did something it did not do.
+These are now checked rather than assumed:
+
+| Operation | What is verified |
+|---|---|
+| Any geometry tool | The active product **is a Design**. In a Drawing/CAM/Render workspace you get a clear error naming the workspace and document, not an obscure `.rootComponent` failure. |
+| `save_document` | Version bump / modified-flag cleared / lineage appeared → **CONFIRMED**, else **UNCONFIRMED**. |
+| `export_step` / `export_stl` / `export_dxf` | `execute()` return **and** the file exists with non-zero size → **CONFIRMED**, else an explicit failure. |
+| `set_parameter` | The stored expression is **read back** and compared. Fusion silently rejects or clamps expressions it dislikes. |
+| `rigid_joint` / `revolute_joint` / `joint_at_point` | Joint **count increased**. |
+| `drill_hole` / `hole_on_face` / `tapped_hole` / `shell_body` | Volume delta, with a no-op warning. |
+| `fillet_edges` / `fillet_edges_smart` | Volume delta **and** face topology (consumed faces). |
+| `cut_prisms` | Volume delta. |
+| `clear_document` | States the target **document name and lineage before destroying anything**. |
+
+**Rule of thumb: if a tool prints UNCONFIRMED or a `***` warning, do not report
+the action as done.** Those messages exist because the underlying API call
+returned successfully while achieving nothing.
+
+---
+
 ## API traps on this build (measured, not guessed)
 
 Each of these cost real debugging time. They fail **quietly** — valid bodies,
@@ -432,6 +551,30 @@ that only reveals itself several operations later.
 **Don't reason about it — use `P_xy` / `P_xz` / `P_yz`** (they take world mm and
 return the right sketch point), and call `verify_plane_mapping(sketch)` once on
 any new, offset, or tangent plane to print its measured basis.
+
+### Degenerate edges crash edge iteration
+Two lofts meeting tangentially can leave a **zero-length edge with fewer than
+two faces**; `e.faces.item(1)` then raises `Bad index parameter`. Guard every
+walk of `body.edges`:
+```python
+if e.faces.count < 2 or to_mm(e.length) < 1e-4: continue
+```
+`edge_ok(e)` and `safe_edges(body)` are injected, and `list_edges` /
+`select_edges` / `fillet_edges_smart` all apply the guard internally.
+
+### `computeAll()` does not guarantee a fresh `body.volume`
+After editing sketch points, `body.volume` and `boundingBox` can read
+**byte-identical** to before, even after `computeAll()`. An identical volume does
+**not** prove the edit failed. Use the injected `refresh_geometry()` (recomputes
+and reports whether volumes moved), and confirm with `cross_section` or point
+sampling.
+
+### `app.data` can be dead for an entire session
+`InternalValidationError : group` on any `app.data` access survives a Fusion
+restart and kills `list_recent_designs`, `open_document`, and `saveAs`.
+`save_document` detects it and falls back to `doc.save()` on an already-saved
+document. **`open_document` and `list_recent_designs` cannot be worked around** —
+they need `app.data`. Have the user open the design in the Fusion UI.
 
 ### `TimelineObject` has no `deleteMe`
 Use `tl.item(i).entity.deleteMe()`. The TimelineObject exposes only

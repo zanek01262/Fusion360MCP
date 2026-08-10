@@ -33,7 +33,7 @@ import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8765
-LISTENER_VERSION = '1.4.1'
+LISTENER_VERSION = '1.7.0'
 PROTOCOL = 2   # bump when the wire schema changes
 CUSTOM_EVENT_ID = 'MCPListenerExec'
 DEFAULT_BUDGET_S = 600.0   # soft budget; job is FLAGGED timeout past this
@@ -59,6 +59,8 @@ _main_thread_alive = [time.time()]
 _busy = [False]
 _current_job = [None]
 _cached_state = ['{}']   # JSON string of last cheap state snapshot
+_refresh_pending = [False]
+_refresh_last = [0.0]
 
 # A live stdout buffer for the currently running job, so GET /job can return
 # partial output mid-flight (incremental progress).
@@ -125,7 +127,34 @@ def to_mm3(vol_cm3):
     return vol_cm3 * 1000.0
 
 def _active_design():
-    return adsk.fusion.Design.cast(app.activeProduct)
+    return _require_design()
+
+def _require_design():
+    """Return the active Design, or raise a CLEAR error saying why not.
+
+    app.activeProduct returns whatever product is active - which is NOT a Design
+    when Fusion is in the Drawing, CAM, Render or Simulation workspace, or when
+    the active document is not a design. Accessing .rootComponent on those fails
+    with an obscure error, or targets something unexpected. Every geometry tool
+    goes through this so the failure is legible instead of mysterious."""
+    prod = app.activeProduct
+    d = adsk.fusion.Design.cast(prod)
+    if d is None:
+        try:
+            pt = prod.productType
+        except Exception:
+            pt = type(prod).__name__
+        try:
+            dn = app.activeDocument.name
+        except Exception:
+            dn = '(unknown)'
+        raise RuntimeError(
+            "Active product is %r, not a Design (document %r). Fusion is in a "
+            "non-modelling workspace (Drawing/CAM/Render/Simulation) or this "
+            "document is not a design. Switch to the DESIGN workspace, or use "
+            "activate_document() to select the right document, then retry."
+            % (pt, dn))
+    return d
 
 def assert_scale(max_mm=2000.0):
     d = _active_design()
@@ -329,6 +358,91 @@ def retire_body(body):
         print('[retire_body] failed: ' + str(_e))
         return False
 
+def edge_ok(e, min_len_mm=1e-4):
+    """True if an edge is safe to inspect. Two lofts meeting tangentially can
+    leave a ZERO-LENGTH edge with fewer than two faces, and e.faces.item(1) then
+    raises 'Bad index parameter'. Every helper that walks body.edges uses this;
+    use it in your own loops too."""
+    try:
+        if e.faces.count < 2:
+            return False
+        if to_mm(e.length) < min_len_mm:
+            return False
+    except Exception:
+        return False
+    return True
+
+def edge_face_pair(e):
+    """('Cylinder','Cone') style surface-type pair for an edge, or None if the
+    edge is degenerate. Classifying edges by adjacent surface type is how you
+    target a fillet - this is the classifier so callers stop re-implementing it."""
+    if not edge_ok(e):
+        return None
+    try:
+        a = type(e.faces.item(0).geometry).__name__.replace('adsk::core::', '')
+        b = type(e.faces.item(1).geometry).__name__.replace('adsk::core::', '')
+        return tuple(sorted((a, b)))
+    except Exception:
+        return None
+
+def safe_edges(body, min_len_mm=1e-4):
+    """Iterate a body's edges with degenerate ones filtered out."""
+    out = []
+    for e in body.edges:
+        if edge_ok(e, min_len_mm):
+            out.append(e)
+    return out
+
+def path_report(path, label='path'):
+    """Print a Path's segment count and total length. A mis-chained path
+    silently produces a short sweep with no error - segment count is the only
+    cheap way to catch it."""
+    try:
+        n = path.count
+        L = 0.0
+        for i in range(n):
+            try:
+                L += path.item(i).curve.length * 10.0
+            except Exception:
+                pass
+        print('[%s] segments=%d total_length=%.2f mm' % (label, n, L))
+        if n <= 1:
+            print('[%s] NOTE: only %d segment - if you expected a chain, the '
+                  'connection test may have matched the same point twice '
+                  '(sketch entity properties return FRESH wrappers, so `is` '
+                  'comparison is always False - compare .geometry coords).'
+                  % (label, n))
+        return n
+    except Exception as _e:
+        print('[%s] could not report: %s' % (label, _e))
+        return -1
+
+def refresh_geometry():
+    """Force a recompute and return whether volumes actually moved.
+    body.volume / boundingBox can read byte-identical after sketch edits even
+    following computeAll(), which makes a correct edit look like a failure."""
+    d = _active_design()
+    root = d.rootComponent
+    before = [volume_of(b) for b in root.bRepBodies]
+    try:
+        d.computeAll()
+    except Exception as _e:
+        print('[refresh] computeAll failed: %s' % _e)
+    try:
+        d.timeline.moveToEnd()
+    except Exception:
+        pass
+    after = [volume_of(b) for b in root.bRepBodies]
+    moved = any(abs(a - b) > 1e-12 for a, b in zip(before, after)) or \
+            len(before) != len(after)
+    print('[refresh] volumes %s after recompute'
+          % ('CHANGED' if moved else 'identical'))
+    if not moved:
+        print('[refresh] identical volume does NOT prove the geometry is '
+              'unchanged - cached values can survive a sketch edit. Confirm '
+              'with cross_section or pointContainment sampling.')
+    return moved
+
 def progress(msg):
     """Emit an incremental progress line. Visible via GET /job before the call
     finishes - use it to mark stages of a long operation."""
@@ -398,32 +512,86 @@ def commit_tool_body(tool_body_temp, target_body, keep_tool=False):
 '''
 
 
+def _doc_identity(doc):
+    """Every identity signal for one document, read INDEPENDENTLY.
+
+    Critical: doc.dataFile routes through app.data, which throws
+    InternalValidationError for a whole session on some builds. When that
+    happens a SAVED document looks unsaved - and any logic that branches on it
+    will saveAs (creating a NEW document) instead of versioning the open one.
+    So dataFile is captured separately and its failure is reported as
+    'unknown', never as 'unsaved'."""
+    info = {'name': None, 'is_saved_flag': None, 'is_modified': None,
+            'lineage_id': None, 'version': None, 'data_ok': None,
+            'path': None}
+    try:
+        info['name'] = doc.name
+    except Exception:
+        info['name'] = '(unreadable)'
+    for attr, key in (('isSaved', 'is_saved_flag'), ('isModified', 'is_modified')):
+        try:
+            info[key] = bool(getattr(doc, attr))
+        except Exception:
+            info[key] = None          # attribute absent on this build
+    try:
+        df = doc.dataFile
+        if df is None:
+            info['data_ok'] = True
+            info['lineage_id'] = None      # genuinely never saved
+        else:
+            info['data_ok'] = True
+            info['lineage_id'] = df.id
+            try:
+                info['version'] = df.versionNumber
+            except Exception:
+                pass
+            try:
+                info['path'] = df.parentFolder.name
+            except Exception:
+                pass
+    except Exception:
+        # app.data is broken - we CANNOT know the lineage. Say so explicitly.
+        info['data_ok'] = False
+        info['lineage_id'] = 'UNKNOWN (app.data unavailable)'
+    return info
+
+
 def _cheap_state_snapshot():
-    """Build a CHEAP state dict - counts and identity only, NO geometry work.
-    Runs on the main thread (called at the end of each job)."""
+    """CHEAP state - counts and identity only, NO geometry work. Runs on the
+    main thread at the end of each job. Includes EVERY open document so a
+    caller can see what the user sees, not just the active one."""
     try:
         doc = app.activeDocument
         design = adsk.fusion.Design.cast(app.activeProduct)
         root = design.rootComponent if design else None
-        name = doc.name if doc else '(none)'
-        lineage = ''
+        ident = _doc_identity(doc) if doc else {}
+        others = []
         try:
-            if doc and doc.dataFile:
-                lineage = doc.dataFile.id
+            for i in range(app.documents.count):
+                d = app.documents.item(i)
+                di = _doc_identity(d)
+                di['active'] = (di.get('name') == ident.get('name'))
+                others.append(di)
         except Exception:
-            lineage = '(unsaved)'
+            pass
         tl_count = 0
         try:
             tl_count = design.timeline.count if design else 0
         except Exception:
             tl_count = -1
         return {
-            'active_document': name,
-            'lineage_id': lineage,
+            'active_document': ident.get('name'),
+            'lineage_id': ident.get('lineage_id'),
+            'is_saved_flag': ident.get('is_saved_flag'),
+            'is_modified': ident.get('is_modified'),
+            'version': ident.get('version'),
+            'data_ok': ident.get('data_ok'),
+            'open_documents': others,
             'bodies': root.bRepBodies.count if root else 0,
             'sketches': root.sketches.count if root else 0,
             'components': root.allOccurrences.count if root else 0,
             'timeline_features': tl_count,
+            'snapshot_time': time.time(),
         }
     except Exception:
         return {'error': 'state snapshot failed', 'trace': traceback.format_exc()}
@@ -471,6 +639,11 @@ def _execute_job(job):
         _busy[0] = False
         _current_job[0] = None
         _main_thread_alive[0] = time.time()
+        with _job_lock:
+            _refresh_pending[0] = False
+        if job.get('internal'):
+            with _job_lock:
+                _jobs.pop(job['id'], None)
         # refresh cheap cached state after every job
         try:
             _cached_state[0] = json.dumps(_cheap_state_snapshot())
@@ -532,6 +705,37 @@ def _envelope(job, include_partial=True):
     }
 
 
+def _request_identity_refresh():
+    """Queue ONE identity refresh on the main thread. Called on demand by the
+    /state endpoint when its cache is stale - NOT on a timer.
+
+    The previous implementation fired a main-thread job every 4 seconds for as
+    long as Fusion was open (~21,600 interrupts/day), each one enumerating every
+    open document and touching dataFile - which raises (expensively) on builds
+    where app.data is broken. Cost was paid continuously even when nobody was
+    using the tool. Now the cost is paid only when someone actually asks for
+    state and the answer is stale."""
+    now = time.time()
+    with _job_lock:
+        # coalesce: at most one in-flight refresh, and no more than one per 2s
+        if _refresh_pending[0] or (now - _refresh_last[0]) < 2.0:
+            return
+        _refresh_pending[0] = True
+        _refresh_last[0] = now
+        _counter[0] += 1
+        jid = 'refresh-%d' % _counter[0]
+        _jobs[jid] = {'id': jid, 'status': 'queued', 'code': 'pass',
+                      'stdout': [], 'traceback': '', 'started': None,
+                      'finished': None, 'budget_s': 15.0,
+                      'elapsed_ms': None, 'internal': True}
+    try:
+        adsk.core.Application.get().fireCustomEvent(CUSTOM_EVENT_ID, jid)
+    except Exception:
+        with _job_lock:
+            _refresh_pending[0] = False
+            _jobs.pop(jid, None)
+
+
 def _watchdog():
     """Background thread: flags jobs that blow past their budget as 'timeout'.
     Cannot force-kill a hung main thread, but gives the caller a clear signal
@@ -585,6 +789,15 @@ class RequestHandler(BaseHTTPRequestHandler):
             cached = json.loads(_cached_state[0])
         except Exception:
             cached = {}
+        try:
+            _age = time.time() - float(cached.get('snapshot_time') or 0)
+            cached['snapshot_age_s'] = round(_age, 1)
+            cached['snapshot_fresh'] = _age < 10.0
+        except Exception:
+            cached['snapshot_age_s'] = None
+            cached['snapshot_fresh'] = False
+        if not cached.get('snapshot_fresh'):
+            _request_identity_refresh()   # lazy: only when actually stale
         cached['listener_version'] = LISTENER_VERSION
         cached['protocol'] = PROTOCOL
         cached['busy'] = _busy[0]

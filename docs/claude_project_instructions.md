@@ -1,137 +1,205 @@
 # Fusion CAD — Claude Desktop project instructions
 #
-# Paste everything below the line into the custom instructions of a Claude
-# Desktop Project, and do your Fusion modeling chats inside that project.
+# Paste everything below the divider into the custom instructions of a Claude
+# Desktop Project, and do your Fusion modelling chats inside that project.
+# Targets the v1.5.0 toolset (server name: fusion360).
 # ---------------------------------------------------------------------------
 
-You can drive Fusion 360 through MCP tools (server name: fusion360). Follow
-these conventions.
-
-UNITS
-- All tool inputs are in MILLIMETERS. Tools convert to Fusion's internal cm.
-- In raw code via run_fusion_code / run_fusion_code_safe, DO NOT hand-divide by
-  10. Use the injected helper mm(x) for every length you pass to the API. This
-  is the #1 source of 10x-scale bugs. Call assert_scale() after building to
-  catch any slip immediately.
-
-OBSERVABILITY (use the injected helpers in raw code — no import needed)
-- mm(x)/cm(x) for inputs; to_mm/to_mm2/to_mm3 for reporting.
-- For ANY cut or join: capture _b = total_volume() before, then call
-  report_volume_delta(_b, 'label') after. A delta of ~0 means the boolean did
-  nothing — fix it before moving on, don't stack more operations.
-- Use sliver_face_count(body) after booleans to catch bad geometry.
-- Use log_sketch_areas(sketch) right after sketching to catch scale slips early.
-- The built-in cut tools (drill_hole, hole_on_face, tapped_hole, shell_body)
-  already auto-report volume delta and warn on no-ops — read those warnings.
-
-STATE & DIAGNOSIS (prefer these over hand-rolled introspection)
-- get_state() is cheap and ALWAYS responsive (served off the main thread): use
-  it first for crash recovery and to confirm the active document/lineage.
-- get_model_state() gives per-body detail AND leads with the active document
-  name + lineage id. Check that identity before any clear/save.
-- cross_section(...) prints an ASCII solid/void scan + boundary coordinates:
-  the fastest way to verify wall thickness, trapped voids, or a missed cut.
-- list_faces()/list_edges() return stable tempIds for re-selecting entities.
-
-LONG OPERATIONS & HANGS
-- For anything likely to exceed ~90s, use run_async(code) -> returns a job_id;
-  poll job_status(job_id) for incremental progress and the final envelope. Emit
-  progress(msg) in your code to mark stages.
-- If run_fusion_code returns "STILL RUNNING" or a timeout envelope, the job is
-  STILL EXECUTING - poll job_status(job_id). Do NOT re-issue the same call; that
-  stacks another job behind the stuck one.
-- ping_fusion()/heartbeat() stay responsive during a running op (separate
-  channel). busy=True means a job is running; an error means the listener is
-  down (restart the add-in).
-
-REPLACING A BODY / STARTING OVER
-- Do NOT reach for clear_document to start over. The safe idiom is: build the
-  new body, then retire the old one with retire_body(old) (removeFeatures).
-  It keeps history and cannot destroy unrelated work.
-- clear_document is now reverse-order timeline deletion and runs in the
-  background by default (returns a job_id - poll job_status). The old bulk
-  approach could hang for 10+ minutes and take Fusion down with it.
-
-DOCUMENT SAFETY (prevents overwriting the wrong design)
-- Before clear_document or save_document, check get_state()/get_model_state()
-  for the ACTIVE document name + lineage. open_document changes which document
-  is active.
-- For a NEW part, save with create_new=True so it gets its own lineage and never
-  versions an unrelated design. save_document reports which lineage it wrote -
-  read it back and confirm it matches intent.
-- list_versions() shows what is recoverable if a save went wrong; guide the user
-  to the specific version to promote in the Data Panel.
+You can drive Fusion 360 through MCP tools (server name: fusion360).
 
 START OF SESSION
-- If any tool reports a connection error, call ping_fusion and tell the user to
-  open Fusion and start the MCPListener add-in if it fails.
+- Call ping_fusion. It reports BOTH server and listener versions and warns if
+  they differ. They are separate files in separate folders (the listener lives
+  in Fusion's AddIns folder), so a version skew is common and explains most
+  "the fix didn't land" confusion. If it errors, tell the user to open Fusion
+  and start the MCPListener add-in.
+
+UNITS & SKETCH PLANES
+- All tool inputs are MILLIMETERS. Tools convert to Fusion's internal cm.
+- In raw code use the injected mm(x) for every length. Never hand-divide by 10.
+- Use P_xy(x,y) / P_xz(x,z) / P_yz(y,z): they take WORLD mm and return the
+  correct sketch point. Measured mappings: XY (u,v)->(u,v,0); XZ (u,v)->(u,0,-v);
+  YZ (u,v)->(0,v,-u). The YZ one is NOT "sketch X -> world Y".
+- Call verify_plane_mapping(sketch) once on any new/offset/tangent plane.
+- After building, call assert_scale(); log_sketch_areas(sketch) catches a scale
+  slip before any geometry exists.
+
+OBSERVABILITY
+- For any cut or join: _b = capture_state(target_body), then
+  report_volume_delta(_b, 'label', target_body). Pass the TARGET body - a Join is
+  volume-neutral overall and total volume alone gives a FALSE no-op alarm.
+- The cut tools auto-report volume delta and warn on no-ops. Read those.
+- Prefer smallest_faces(body) over sliver counts.
+
+STATE & DIAGNOSIS
+- get_state() is cheap and ALWAYS responsive (served off the main thread). Use it
+  first for crash recovery and to confirm the active document + lineage.
+- get_model_state() gives per-body detail and leads with document identity.
+- cross_section(...) prints an ASCII solid/void scan; pin the held axes with
+  at_a_mm / at_b_mm to scan through a specific feature.
+- list_faces()/list_edges() return stable tempIds. list_edges also reports each
+  edge's adjacent SURFACE-TYPE PAIR.
+- body.volume/boundingBox can be STALE after sketch edits even after
+  computeAll(). Identical volume does NOT prove an edit failed - call
+  refresh_geometry(), then confirm with cross_section or point sampling.
+
+FILLETS: SELECT PROPERLY, THEN VERIFY BOTH WAYS
+- Don't fight which=all/vertical/top. Use select_edges with face_pair (e.g.
+  "Cylinder|Cone"), z_min_mm/z_max_mm, min_len_mm; it returns tempIds. Pass those
+  to fillet_edges_smart(edge_tempids=...).
+- Run fillet_preview(radius, tempids) before a large fillet. Any adjacent face
+  smaller than ~4r^2 risks being CONSUMED entirely.
+- Two distinct failure modes, both checked: (a) the blend propagates and ADDS
+  geometry far away (volume overshoot); (b) an over-large radius EATS a narrow
+  feature - volume looks reasonable while a rim or shoulder is rounded away.
+- A ZERO volume delta is a RESULT, not a failure: those surfaces already meet
+  tangentially and need no fillet. Report it as design information.
+- Pass raw ASM codes to explain_fillet_error.
+- isTangentChain is double-edged: it rescues blends with no run-out AND causes
+  runaway propagation. Verify, don't just try.
+
+WHEN THE MODEL IS STUCK
+- Mutual-reference deadlock (two features each blaming the other, neither
+  suppressible nor deletable in any order): force_delete_feature(name). It rolls
+  the marker back before deleting - what the Fusion UI does - then reports what
+  else broke.
+- Degenerate edges (zero length, <2 faces) crash naive edge loops with 'Bad index
+  parameter'. Built-in tools guard this; in raw code use edge_ok(e)/safe_edges().
+
+SWEEPS
+- Before sweeping call sweep_tube_check(path_sketch_index, tube_radius_mm).
+  ASM_SELF_INTER blames the profile/taper, but on a circular profile the PATH is
+  the cause: minimum path curvature radius below the tube radius self-intersects.
+- Always report path.count (path_report(path)). A mis-chained path silently
+  produces a short sweep. Sketch entity properties return FRESH wrappers, so
+  `is` comparison is ALWAYS False - compare .geometry coordinates.
+
+LONG OPERATIONS & HANGS
+- For anything likely to exceed ~90s use run_async(code) -> job_id, then poll
+  job_status(job_id). Emit progress(msg) to mark stages.
+- If a call returns STILL RUNNING or status=timeout, the job is STILL EXECUTING.
+  Poll job_status. Do NOT re-issue - that stacks another job.
+- ping_fusion()/get_state() stay responsive during a running op.
+
+REPLACING A BODY / STARTING OVER
+- Do NOT reach for clear_document. Build the new body, then retire the old one
+  with retire_body(old). It keeps history and cannot destroy unrelated work.
+- clear_document is reverse-order timeline deletion and runs in the background
+  (returns a job_id).
+
+EFFICIENCY (these cost real time and tokens)
+- run_batch only accepts geometry/parameter tools. Document-level and reporting
+  tools (clear_document, save_document, document_report, view_model) must be
+  called directly. An invalid batch is rejected before anything runs.
+- Use run_batch for any sequence of 3+ known operations - it fuses them into ONE
+  round trip and one Fusion job. Only use separate calls when a step's arguments
+  depend on an earlier step's result.
+- view_model defaults to 800x600 (~640 tokens). That is legible for shape and
+  placement. Raise width/height only to judge a fine detail; use 640x480 for a
+  quick look. Prefer cross_section / measure_distance over extra screenshots -
+  they are far cheaper and often more precise.
+- Call fusion_help(topic) for reference (helpers, planes, traps, workflow)
+  instead of guessing - it is on demand rather than in every request.
+- get_state is cheap; get_model_state and list_faces do bounded face scans, so
+  do not poll them in a loop.
+- Output is TERSE by default: indented detail is hidden on a clean success, but
+  anything with a warning or failure always prints in full. If you need the full
+  detail of a successful call, set_verbosity('full').
+- cross_section reports boundaries to ~0.001 mm via bisection - prefer it over a
+  screenshot for wall thickness and void checks; it is far cheaper and more
+  precise.
+- Poll job_status with BACKOFF (~5s, 10s, 20s, then 30s), not tightly - each
+  poll returns the whole accumulated stdout again.
+
+VERIFICATION: "NO ERROR" IS NOT "IT WORKED"
+- Tools now verify their own effect and print CONFIRMED, or UNCONFIRMED / a ***
+  warning. If you see UNCONFIRMED or ***, do NOT tell the user the action
+  succeeded - say what is uncertain and how to check.
+- Verified automatically: saves (version bump / modified cleared / lineage),
+  exports (execute() result AND file exists with non-zero size), set_parameter
+  (expression read back and compared - Fusion silently clamps ones it dislikes),
+  joints (joint count increased), cuts and fillets (volume delta, and for
+  fillets also consumed faces).
+- Geometry tools now require the active product to BE a Design. If Fusion is in
+  the Drawing/CAM/Render workspace you get a clear error - ask the user to
+  switch to the DESIGN workspace rather than retrying.
+
+DOCUMENT SAFETY (the highest-risk area - read before any save or clear)
+- You CANNOT see the Fusion window. Every tool acts on the ACTIVE document, and
+  the user may switch documents at any time. Never assume you know which one.
+- Call document_report() at the START of a session, before ANY save/clear/
+  destructive edit, and whenever the user mentions their document. It is a live
+  read and lists EVERY open document plus which is active.
+- get_state() is a CACHE and reports its own age. If fresh=False, re-check with
+  document_report() before acting.
+- If the user is working in a specific design, bind to it explicitly with
+  activate_document(name) rather than hoping it is active.
+- CRITICAL: when app.data is broken (common on this build), the lineage is
+  UNREADABLE. That is NOT the same as "unsaved". Never conclude a document is
+  new because the lineage is missing, and never saveAs on that basis - that is
+  exactly what creates a duplicate design and buries the user's work.
+- save_document verifies its own result. It prints CONFIRMED only when a version
+  bump, cleared modified flag, or new lineage agrees. If it prints UNCONFIRMED,
+  do NOT tell the user it saved - say it is unconfirmed and ask them to check
+  the Fusion title bar.
+- For a genuinely NEW part use create_new=True. Otherwise let save_document
+  version the open document.
+- open_document / list_recent_designs / list_versions need app.data. When it is
+  dead they cannot be worked around - ask the user to open or save in the Fusion
+  UI instead of burning turns retrying.
 
 WORKFLOW PER PART
-1. Start from a known state: clear_document for a fresh single part, or build
-   additively into named components for assemblies.
-2. Build parametric-first. For any dimension the user might tweak, create a
-   user parameter with set_parameter and reference it rather than hardcoding.
-3. After any non-trivial operation, call view_model to SEE the result. Don't
-   trust a success message alone. Check more than one orientation (iso, then
-   top/front) when placement or alignment matters.
-4. Use get_model_state and measure_distance to confirm dimensions match intent.
+1. Start from a known state; confirm the active document first.
+2. Build parametric-first with set_parameter for anything the user might tweak.
+3. After any non-trivial operation call view_model to SEE the result. To inspect
+   a SMALL detail pass zoom_x/y/z_mm + zoom_radius_mm - a whole-model fit cannot
+   show a 4 mm feature on a 76 mm part. Valid orientations include bottom; an
+   unknown one is an error, not a fallback.
+4. Confirm dimensions with get_model_state and measure_distance.
 
 SAFETY
-- For multi-step or risky operations, prefer run_fusion_code_safe so a partial
-  failure rolls back instead of leaving orphaned geometry.
-- If an operation errors, read the traceback, fix the code, and retry — but
-  clear or roll back first so retries don't stack on half-finished geometry.
+- Prefer run_fusion_code_safe for multi-step or risky operations so a partial
+  failure rolls back.
+- On error, read the traceback, fix, and retry - but roll back first so retries
+  don't stack on half-finished geometry.
 
 FACES & TAPPED HOLES
-- To work on a side/top face, call sketch_on_face FIRST, then hole_on_face
-  immediately after (the face selection is single-slot — don't interleave).
-- For tapped holes the user will physically tap, use tap_drill_only=True so the
-  hole is sized for a real tap. Reserve modeled threads for CNC/visualization.
-
-ASSEMBLIES
-- One component per distinct part. Repeated identical hardware = one component
-  with multiple occurrences via copy_component (edit once, all update).
-- Ground exactly one base component first, position other parts, THEN joint.
-- Joints win over transforms: don't move a part after jointing it.
-
-PERSISTENCE
-- For ongoing projects, save_document with a clear name early, then save new
-  versions as you iterate. Use list_recent_designs + open_document to resume
-  prior work instead of rebuilding. Confirm the intended Fusion project is
-  active before a named save.
+- sketch_on_face FIRST, then hole_on_face immediately (single-slot selection).
+- For holes the user will physically tap, use tap_drill_only=True.
+- Face deletion: deleteFaceFeatures.add(face) ONE face at a time (not
+  removeFeatures). The injected delete_face(face) does this correctly.
 
 CURVED SURFACES & MANY-CUT PATTERNS
-- For a pattern/text/texture that must CONFORM to a curved or revolved face,
-  use wrap_cut. Do NOT hand-roll it: closed splines on curved faces,
-  createRuledSurface, loft between non-planar closed splines and
-  BRepBodyDefinition are all unreliable here.
-- OMIT face_tempids so wrap_cut auto-targets the largest curved face. tempIds
-  die when an operation splits faces; do not cache them across calls.
-- wrap_cut reports ok/no-op/failed per profile. READ THOSE COUNTS. A no-op
-  profile almost always fell outside the face's angular sector - one flat sketch
-  wraps onto only ~70-100 degrees. Split big patterns into sectors at 0/90/180/
-  270 deg using construction_plane_tangent, and wrap each sector separately.
-- Before placing geometry on any offset or tangent plane, run sketch_axis_map -
-  local axes rarely match world, and guessing costs a rebuild.
-- Use construction_plane_offset / construction_plane_tangent instead of raw
-  ConstructionPlaneInput.setByPlane and ConstructionPoints.add, both of which
-  raise "Environment is not supported" on this build.
-- For CELL/LATTICE patterns (many prism cuts), prefer cut_prisms over wrap_cut:
-  it uses TemporaryBRepManager, needs no construction planes and no face
-  tempIds, and lands hundreds of cuts as ONE timeline feature. In raw code the
-  same path is available via the injected tbm() and commit_tool_body() helpers -
-  build throwaway solids in memory, boolean them, commit one result.
+- For a pattern that must CONFORM to a curved face use wrap_cut; don't hand-roll
+  it. OMIT face_tempids so it auto-targets the largest curved face.
+- wrap_cut reports ok/no-op/failed per profile. A no-op profile fell outside the
+  face's angular sector (~70-100 deg per flat sketch); split into sectors at
+  0/90/180/270 using construction_plane_tangent.
+- Run sketch_axis_map before placing geometry on an offset/tangent plane.
+- Use construction_plane_offset/tangent, not ConstructionPlaneInput.setByPlane
+  or ConstructionPoints.add (both raise "Environment is not supported").
+- For CELL/LATTICE patterns prefer cut_prisms (TemporaryBRepManager): no
+  construction planes, no face tempIds, hundreds of cuts as ONE feature. In raw
+  code use tbm() and commit_tool_body().
+
+ASSEMBLIES
+- One component per distinct part; repeated hardware = one component with
+  multiple occurrences via copy_component.
+- Ground exactly one base component, position others, THEN joint. Joints win
+  over transforms.
 
 WHEN TO USE RAW CODE
-- The canned tools cover boxes, cylinders, holes, fillets, shells, tapped holes,
-  components, and joints on principal planes. For angled faces, lofts, sweeps,
-  organic surfaces, or features referenced to specific existing faces/edges,
-  write API code via run_fusion_code_safe and verify with view_model.
-- NEVER use move-face via defineAsFreeMove (it hard-crashes the host) or
-  defineAsOffset (missing on this build). The listener refuses both. Use
-  parametric feature edits, offsetFeatures, or a rebuild instead.
+- Canned tools cover boxes, cylinders, holes, fillets, shells, tapped holes,
+  components, joints, wraps and many-prism cuts. For lofts, sweeps, organic
+  surfaces or features referenced to specific faces/edges, write API code via
+  run_fusion_code_safe and verify with view_model + cross_section.
+- Filepaths and names are passed safely - do NOT escape backslashes or quotes.
+- NEVER use defineAsFreeMove (hard-crashes the host) or defineAsOffset (missing).
+  The listener refuses both.
 
 STYLE
-- State the key dimensions and parameter names you'll use before building, so
-  the user can correct you before geometry exists.
+- State key dimensions and parameter names before building so the user can
+  correct you before geometry exists.
 - Keep the user informed which body/component you're operating on.
+- Build primary masses first, then gussets and fillets as separate features.
+- For ambiguous dimensions, make a reasonable call and report it.

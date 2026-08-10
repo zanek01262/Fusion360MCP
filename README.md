@@ -16,7 +16,7 @@ exotic stuff.
 
 ## What you get
 
-About 50 tools Claude can call, grouped as:
+About 60 tools Claude can call, grouped as:
 
 - **Primitives & features** — boxes, cylinders, holes, fillets, shells, tapped
   holes (with correct tap-drill sizing for hand-tapping). Cutting tools
