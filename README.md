@@ -100,6 +100,8 @@ You just keep Fusion open with the add-in running.
 | `fusion_mcp_server.py` | The MCP server **Claude Desktop launches**. |
 | `launch.py` / `launch.sh` / `launch.bat` | Preflight health-checker. |
 | `docs/claude_project_instructions.md` | Paste into a Claude Project to teach it the conventions. |
+| `RELEASE_NOTES.md` | Notes for the current release (v1.8.1) — covers everything since v1.4.1. |
+| `CHANGELOG.md` | Full per-version history. |
 | `requirements.txt` | Python dependencies. |
 | `docs/INSTALL.md` | Step-by-step install + troubleshooting. |
 | `docs/pdf/` | Print-ready PDFs of every doc (plus `ALL-DOCS` combined). |

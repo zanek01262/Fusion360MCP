@@ -47,6 +47,11 @@ guard lookups). See `docs/ARCHITECTURE.md` → "Extending the toolset."
 
 ## Releases
 
+`RELEASE_NOTES.md` at the package root holds the notes for the CURRENT release —
+paste its contents straight into the GitHub release body. `CHANGELOG.md` remains
+the full per-version history; RELEASE_NOTES is the narrative summary for the
+version being published.
+
 Tag versions so people can grab a stable zip:
 
 ```bash

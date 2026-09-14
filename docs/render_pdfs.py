@@ -62,6 +62,7 @@ HEADER = ('<div class="title-block"><div style="font-size:9pt;color:#0d3b66;'
 
 DOCS = {
     'README.md': 'Fusion-360-MCP_README.pdf',
+    'RELEASE_NOTES.md': 'Fusion-360-MCP_RELEASE-NOTES.pdf',
     'CHANGELOG.md': 'Fusion-360-MCP_CHANGELOG.pdf',
     'docs/INSTALL.md': 'Fusion-360-MCP_INSTALL.pdf',
     'docs/TOOLS.md': 'Fusion-360-MCP_TOOLS.pdf',
@@ -71,7 +72,9 @@ DOCS = {
 }
 
 # order for the combined volume
-COMBINE = ['Fusion-360-MCP_README.pdf', 'Fusion-360-MCP_CHANGELOG.pdf',
+COMBINE = ['Fusion-360-MCP_README.pdf',
+           'Fusion-360-MCP_RELEASE-NOTES.pdf',
+           'Fusion-360-MCP_CHANGELOG.pdf',
            'Fusion-360-MCP_INSTALL.pdf', 'Fusion-360-MCP_TOOLS.pdf',
            'Fusion-360-MCP_ARCHITECTURE.pdf',
            'Fusion-360-MCP_Project-Instructions.pdf',

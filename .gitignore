@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Fusion / tool runtime artifacts
+fusion_view.png
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Local config that may contain machine-specific paths — never commit secrets
+# or absolute user paths by accident:
+claude_desktop_config.local.json
