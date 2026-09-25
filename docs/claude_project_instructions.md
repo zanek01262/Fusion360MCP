@@ -77,8 +77,11 @@ SWEEPS
 LONG OPERATIONS & HANGS
 - For anything likely to exceed ~90s use run_async(code) -> job_id, then poll
   job_status(job_id). Emit progress(msg) to mark stages.
-- If a call returns STILL RUNNING or status=timeout, the job is STILL EXECUTING.
-  Poll job_status. Do NOT re-issue - that stacks another job.
+- If a call returns STILL RUNNING or budget_exceeded, the job is STILL
+  EXECUTING. Poll job_status until the status is OK or ERROR - that is the real
+  outcome. Do NOT re-issue - that stacks another job.
+- AUTH ERROR means the listener rejected its token: ask the user to Stop -> Run
+  the MCPListener add-in. Do not retry until they have.
 - ping_fusion()/get_state() stay responsive during a running op.
 
 REPLACING A BODY / STARTING OVER
@@ -159,7 +162,8 @@ WORKFLOW PER PART
 
 SAFETY
 - Prefer run_fusion_code_safe for multi-step or risky operations so a partial
-  failure rolls back.
+  failure rolls back. Trust ROLLED BACK; on ROLLBACK INCOMPLETE, run
+  get_model_state before doing anything else.
 - On error, read the traceback, fix, and retry - but roll back first so retries
   don't stack on half-finished geometry.
 
@@ -185,6 +189,10 @@ CURVED SURFACES & MANY-CUT PATTERNS
 ASSEMBLIES
 - One component per distinct part; repeated hardware = one component with
   multiple occurrences via copy_component.
+- Copies are occurrences named 'Screw:1', 'Screw:2' (see list_components).
+  move_component, ground_component and the joint tools need the occurrence
+  name once a part has been copied - the bare component name is then
+  ambiguous and is refused.
 - Ground exactly one base component, position others, THEN joint. Joints win
   over transforms.
 

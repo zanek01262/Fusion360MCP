@@ -18,9 +18,16 @@
 #
 # Install: see docs/INSTALL.md ("Part A: Install the Fusion add-in").
 #
-# Security note: this listens ONLY on 127.0.0.1 (localhost). It executes
-# arbitrary Python sent to it. Do not change the bind address to 0.0.0.0
-# and do not run it on an untrusted network.
+# Security: this executes arbitrary Python, so two checks guard every request.
+#   1. Host header must be localhost. Binding to 127.0.0.1 keeps the network
+#      out, but not a web page in your browser: a DNS-rebinding site reaches
+#      127.0.0.1 under its own hostname, and this check refuses it.
+#   2. X-MCP-Token header must match a random token written at startup to
+#      ~/.fusion_mcp/listener_token (readable only by you). A browser cannot
+#      read that file, and a custom header forces a CORS preflight this server
+#      never approves - so a page cannot even send the request. /ping is the
+#      one exception (liveness + version only, no document data).
+# Do not change the bind address to 0.0.0.0 or forward the port.
 
 import adsk.core
 import adsk.fusion
@@ -30,13 +37,24 @@ import json
 import io
 import time
 import re
+import os
+import hmac
+import secrets
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8765
-LISTENER_VERSION = '1.7.0'
-PROTOCOL = 2   # bump when the wire schema changes
+# Kept in lockstep with SERVER_VERSION in fusion_mcp_server.py - ping_fusion
+# compares them, and tests/test_versions.py fails the build on any drift.
+LISTENER_VERSION = '1.9.0'
+PROTOCOL = 3   # bump when the wire schema changes (3: token auth, budget flag)
 CUSTOM_EVENT_ID = 'MCPListenerExec'
-DEFAULT_BUDGET_S = 600.0   # soft budget; job is FLAGGED timeout past this
+DEFAULT_BUDGET_S = 600.0   # soft budget; job is FLAGGED budget_exceeded past this
+
+TOKEN_DIR = os.path.join(os.path.expanduser('~'), '.fusion_mcp')
+TOKEN_PATH = os.path.join(TOKEN_DIR, 'listener_token')
+TOKEN_HEADER = 'X-MCP-Token'
+_ALLOWED_HOSTS = ('127.0.0.1', 'localhost', '[::1]')
+_token = [None]
 
 app = adsk.core.Application.get()
 ui = app.userInterface
@@ -46,13 +64,14 @@ ui = app.userInterface
 # ---------------------------------------------------------------------------
 # Each job: {id, status, code, stdout(list), traceback, started, finished,
 #            budget_s, elapsed_ms}
-# status in: queued | running | ok | error | timeout
+# status in: queued | running | ok | error; budget_exceeded is a separate flag
 _jobs = {}
 _job_lock = threading.Lock()
 _counter = [0]
 _handlers = []
 _httpd = None
 _custom_event = None
+_stop_event = [None]   # set by stop() so this run's watchdog thread exits
 
 # Liveness + cached cheap state, updated by the main thread, read by HTTP thread.
 _main_thread_alive = [time.time()]
@@ -128,6 +147,67 @@ def to_mm3(vol_cm3):
 
 def _active_design():
     return _require_design()
+
+def _occ_label(o):
+    try:
+        return o.name
+    except Exception:
+        return '?'
+
+def find_occurrence(name):
+    """Resolve ONE occurrence: by its own name first ('Screw:3', what the
+    browser tree shows), then its full path ('Sub:1+Screw:3'), then its
+    component name - accepted only when exactly one occurrence uses that
+    component. Copies made by copy_component share one component, so once
+    'Screw' is copied the bare name is ambiguous: that RAISES, listing the
+    occurrence names to use, instead of silently acting on the first copy."""
+    d = _require_design()
+    occs = list(d.rootComponent.allOccurrences)
+    for attr in ('name', 'fullPathName'):
+        for o in occs:
+            try:
+                if getattr(o, attr) == name:
+                    return o
+            except Exception:
+                pass
+    by_comp = []
+    for o in occs:
+        try:
+            if o.component.name == name:
+                by_comp.append(o)
+        except Exception:
+            pass
+    if len(by_comp) == 1:
+        return by_comp[0]
+    if by_comp:
+        raise RuntimeError(
+            'component %r has %d occurrences (%s) - pass one occurrence name '
+            'to choose which' % (name, len(by_comp),
+                                 ', '.join(_occ_label(o) for o in by_comp)))
+    raise RuntimeError(
+        'no occurrence or component named %r. Available: %s'
+        % (name, ', '.join(_occ_label(o) for o in occs)
+           or '(none - all geometry is in the root component)'))
+
+def find_component(name):
+    """Resolve a COMPONENT (the shared definition) by component name or by any
+    of its occurrence names. Empty name = the root component. RAISES on a miss:
+    silently falling back to root put work in the wrong place."""
+    d = _require_design()
+    root = d.rootComponent
+    if not name:
+        return root
+    occs = list(root.allOccurrences)
+    for o in occs:
+        try:
+            if name in (o.component.name, o.name, o.fullPathName):
+                return o.component
+        except Exception:
+            pass
+    raise RuntimeError(
+        'no component named %r. Available: %s'
+        % (name, ', '.join(sorted(set(o.component.name for o in occs)))
+           or '(none - all geometry is in the root component)'))
 
 def _require_design():
     """Return the active Design, or raise a CLEAR error saying why not.
@@ -556,6 +636,25 @@ def _doc_identity(doc):
     return info
 
 
+def _active_index(docs, idents, active_doc, active_name):
+    """Index of the active document, -1 if ambiguous, None if not found.
+
+    Name comparison alone marks BOTH of two 'Untitled' documents active. Names
+    decide when unique; object equality breaks a tie; if that cannot either,
+    the answer is reported as ambiguous rather than guessed."""
+    named = [i for i, di in enumerate(idents) if di.get('name') == active_name]
+    if len(named) <= 1:
+        return named[0] if named else None
+    same = []
+    for i in named:
+        try:
+            if docs[i] == active_doc:
+                same.append(i)
+        except Exception:
+            pass
+    return same[0] if len(same) == 1 else -1
+
+
 def _cheap_state_snapshot():
     """CHEAP state - counts and identity only, NO geometry work. Runs on the
     main thread at the end of each job. Includes EVERY open document so a
@@ -567,10 +666,13 @@ def _cheap_state_snapshot():
         ident = _doc_identity(doc) if doc else {}
         others = []
         try:
-            for i in range(app.documents.count):
-                d = app.documents.item(i)
-                di = _doc_identity(d)
-                di['active'] = (di.get('name') == ident.get('name'))
+            docs = [app.documents.item(i) for i in range(app.documents.count)]
+            idents = [_doc_identity(d) for d in docs]
+            active_i = _active_index(docs, idents, doc, ident.get('name'))
+            for i, di in enumerate(idents):
+                # True / False, or None when two open documents share the
+                # active name and the API cannot say which one is active
+                di['active'] = (None if active_i == -1 else i == active_i)
                 others.append(di)
         except Exception:
             pass
@@ -622,15 +724,16 @@ def _execute_job(job):
         with contextlib.redirect_stdout(tee):
             exec(compile(_HELPER_SOURCE, '<helpers>', 'exec'), ns)
             exec(compile(job['code'], '<mcp>', 'exec'), ns)
+        # A job that overran its budget still reaches ok/error here: the
+        # watchdog only sets budget_exceeded. (It used to set a terminal
+        # 'timeout' status that hid the real outcome, so callers retried
+        # operations that had in fact completed.)
         with _job_lock:
-            # don't override a watchdog-set timeout flag
-            if job['status'] == 'running':
-                job['status'] = 'ok'
+            job['status'] = 'ok'
             job['traceback'] = ''
     except Exception:
         with _job_lock:
-            if job['status'] == 'running':
-                job['status'] = 'error'
+            job['status'] = 'error'
             job['traceback'] = traceback.format_exc()
     finally:
         with _job_lock:
@@ -681,6 +784,8 @@ def _envelope(job, include_partial=True):
         tb = job.get('traceback', '')
         started = job.get('started')
         elapsed = job.get('elapsed_ms')
+        over = bool(job.get('budget_exceeded'))
+        budget = job.get('budget_s')
     if elapsed is None and started is not None:
         elapsed = int((time.time() - started) * 1000)
     stdout = ''.join(lines)
@@ -695,7 +800,9 @@ def _envelope(job, include_partial=True):
         'protocol': PROTOCOL,
         'stdout_bytes': len(stdout),
         'job_id': job['id'],
-        'status': status,                 # queued|running|ok|error|timeout
+        'status': status,                 # queued|running|ok|error
+        'budget_exceeded': over,          # ran past budget_s (may still finish)
+        'budget_s': budget,
         'stdout': stdout,
         'traceback': tb,
         'elapsed_ms': elapsed if elapsed is not None else 0,
@@ -736,30 +843,103 @@ def _request_identity_refresh():
             _jobs.pop(jid, None)
 
 
-def _watchdog():
-    """Background thread: flags jobs that blow past their budget as 'timeout'.
-    Cannot force-kill a hung main thread, but gives the caller a clear signal
-    instead of a dead channel."""
-    while True:
-        time.sleep(2.0)
-        now = time.time()
-        with _job_lock:
-            for job in _jobs.values():
-                if job['status'] == 'running' and job.get('started'):
-                    if now - job['started'] > job.get('budget_s', DEFAULT_BUDGET_S):
-                        job['status'] = 'timeout'
-                        job['timed_out_at'] = now
+def _flag_overruns(now):
+    """Flag running jobs that are past their budget. Only FLAGS - status still
+    moves to ok/error when the job ends, so the caller learns the outcome."""
+    with _job_lock:
+        for job in _jobs.values():
+            if (job['status'] == 'running' and job.get('started')
+                    and not job.get('budget_exceeded')
+                    and now - job['started']
+                    > job.get('budget_s', DEFAULT_BUDGET_S)):
+                job['budget_exceeded'] = True
+                job['budget_exceeded_at'] = now
+
+
+def _watchdog(stop_event):
+    """Background thread: flags jobs that run past their budget. Cannot
+    force-kill a hung main thread, but gives the caller a clear signal instead
+    of a dead channel.
+
+    Exits when stop_event is set. Without that, every Stop -> Run of the add-in
+    (which every upgrade asks for) left another watchdog thread running."""
+    while not stop_event.wait(2.0):
+        _flag_overruns(time.time())
+
+
+def _write_token():
+    """Create this run's random auth token and write it where only the
+    current user can read it. fusion_mcp_server.py reads it per request, so a
+    listener restart (new token) needs no server restart."""
+    tok = secrets.token_urlsafe(32)
+    os.makedirs(TOKEN_DIR, exist_ok=True)
+    try:
+        os.chmod(TOKEN_DIR, 0o700)
+    except Exception:
+        pass
+    fd = os.open(TOKEN_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(tok)
+    _token[0] = tok
+    return tok
+
+
+def _remove_token():
+    _token[0] = None
+    try:
+        os.remove(TOKEN_PATH)
+    except Exception:
+        pass
 
 
 class RequestHandler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    # ---- request guard (see the Security note at the top of this file) ----
+    def _host_ok(self):
+        host = (self.headers.get('Host') or '').strip().lower()
+        if host.startswith('['):
+            name = host.split(']')[0] + ']'
+        else:
+            name = host.split(':')[0]
+        return name in _ALLOWED_HOSTS
+
+    def _token_ok(self):
+        want = _token[0]
+        got = self.headers.get(TOKEN_HEADER) or ''
+        return bool(want) and hmac.compare_digest(got.encode('utf-8'),
+                                                  want.encode('utf-8'))
+
+    def _guard(self, need_token=True):
+        """True if the request may proceed; otherwise responds and returns
+        False. Refusals carry version + protocol so the server can explain."""
+        if not self._host_ok():
+            self._respond(403, {
+                'ok': False, 'status': 'error', 'error': 'forbidden_host',
+                'listener_version': LISTENER_VERSION, 'protocol': PROTOCOL,
+                'output': 'REFUSED: Host %r is not localhost.'
+                          % self.headers.get('Host')})
+            return False
+        if need_token and not self._token_ok():
+            self._respond(401, {
+                'ok': False, 'status': 'error', 'error': 'bad_token',
+                'listener_version': LISTENER_VERSION, 'protocol': PROTOCOL,
+                'output': 'REFUSED: missing or wrong %s header. The token is '
+                          'in %s and changes each time the add-in starts.'
+                          % (TOKEN_HEADER, TOKEN_PATH)})
+            return False
+        return True
+
     # ---- GET: ping / state / job status (all served WITHOUT the main thread) ----
     def do_GET(self):
         path = self.path.split('?')[0].rstrip('/')
         if path in ('', '/ping', '/'):
+            if not self._guard(need_token=False):
+                return
             return self._ping()
+        if not self._guard():
+            return
         if path == '/state':
             return self._state()
         if path.startswith('/job/'):
@@ -816,6 +996,8 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     # ---- POST: exec (async) / exec_sync (blocking, back-compat) ----
     def do_POST(self):
+        if not self._guard():
+            return
         try:
             length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(length).decode('utf-8')
@@ -848,7 +1030,7 @@ class RequestHandler(BaseHTTPRequestHandler):
     def _enqueue(self, code, budget):
         with _job_lock:
             # prune: keep only the 50 most recent finished jobs
-            done = [j for j in _jobs.values() if j['status'] in ('ok','error','timeout')]
+            done = [j for j in _jobs.values() if j['status'] in ('ok', 'error')]
             if len(done) > 50:
                 done.sort(key=lambda j: j.get('finished') or 0)
                 for old in done[:-50]:
@@ -872,7 +1054,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         while time.time() < deadline:
             with _job_lock:
                 st = job['status']
-            if st in ('ok', 'error', 'timeout'):
+            if st in ('ok', 'error'):
                 self._respond(200, _envelope(job))
                 return
             time.sleep(0.1)
@@ -906,7 +1088,11 @@ def run(context):
         except Exception:
             pass
 
-        wd = threading.Thread(target=_watchdog, daemon=True)
+        _write_token()
+
+        ev = threading.Event()
+        _stop_event[0] = ev
+        wd = threading.Thread(target=_watchdog, args=(ev,), daemon=True)
         wd.start()
 
         _httpd = ThreadingHTTPServer(('127.0.0.1', PORT), RequestHandler)
@@ -925,6 +1111,10 @@ def run(context):
 
 def stop(context):
     global _httpd, _custom_event
+    if _stop_event[0] is not None:
+        _stop_event[0].set()
+        _stop_event[0] = None
+    _remove_token()
     try:
         if _httpd:
             _httpd.shutdown()

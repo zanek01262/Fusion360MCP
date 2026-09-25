@@ -9,6 +9,7 @@ Requires:  python -m pip install weasyprint markdown pypdf
 Outputs to docs/pdf/.
 """
 import os
+import re
 import sys
 
 try:
@@ -55,7 +56,18 @@ strong { color: #0a0a0a; }
   border-bottom: 2px solid #d0d7de; }
 """
 
-VERSION = "1.8.1"
+def _release_version():
+    """SERVER_VERSION from fusion_mcp_server.py - the one version number, so
+    the PDFs can never be stamped with a stale release."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, '..', 'fusion_mcp_server.py'), encoding='utf-8') as f:
+        m = re.search(r'^SERVER_VERSION = "([^"]+)"', f.read(), re.M)
+    if not m:
+        sys.exit("Could not find SERVER_VERSION in fusion_mcp_server.py")
+    return m.group(1)
+
+
+VERSION = _release_version()
 HEADER = ('<div class="title-block"><div style="font-size:9pt;color:#0d3b66;'
           'font-weight:600;letter-spacing:1px;">FUSION 360 MCP &middot; v'
           + VERSION + '</div></div>')

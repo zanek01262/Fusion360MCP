@@ -1,5 +1,107 @@
 # Changelog
 
+## 1.9.0
+
+A full-codebase review: one security hole, plus tools that reported success they
+hadn't earned or quietly did something other than asked. **Protocol 2 → 3:
+update both files.**
+
+### Security - web pages could run code through the listener
+Loopback binding keeps the network out, not the browser. A page could POST
+`text/plain` to `127.0.0.1:8765/exec` (no CORS preflight needed), and the
+listener executed it; DNS rebinding reached it too.
+- Every request must carry a `Host` of `127.0.0.1` / `localhost` (403
+  otherwise).
+- Every request except `/ping` must carry `X-MCP-Token` matching a random token
+  the add-in writes to `~/.fusion_mcp/listener_token` at startup (401
+  otherwise). The server reads the file on every request, so an add-in restart
+  needs no server restart.
+- Refusals carry version + protocol; the server turns them into an actionable
+  AUTH ERROR.
+
+### Fixed - `run_fusion_code_safe` rollback was a no-op that reported success
+Called `TimelineObject.deleteMe()`, which does not exist, inside `except: pass`,
+then printed ROLLED BACK unconditionally. Now:
+- deletes via `.entity.deleteMe()`, only the features the call itself inserted
+  at the marker (never ones already past a rolled-back marker);
+- verifies the timeline count and prints ROLLBACK INCOMPLETE when it isn't back;
+- says NO ROLLBACK on direct-modelling documents.
+
+### Fixed - `ping_fusion` warned on every correct 1.8.x install
+Listener was still `1.7.0` after server-only releases. `LISTENER_VERSION` now
+tracks `SERVER_VERSION`; `tests/test_versions.py` enforces it.
+
+### Fixed - `get_model_state` reported UNSAVED when app.data was unavailable
+Now UNKNOWN, matching `document_report` - UNSAVED leads to saveAs and a
+duplicate design.
+
+### Fixed - a job that overran its budget stayed `timeout` forever
+The watchdog now sets `budget_exceeded` and the status still ends ok/error, so
+the caller learns whether a long operation landed.
+
+### Fixed - exports could CONFIRM a stale file
+CONFIRMED now needs the file's mtime to change during the call; `export_dxf`
+checks `saveAsDXF`'s return value.
+
+### Fixed - `tapped_hole` silently picked wrong drills
+Case-insensitive parsing; metric drill = major − pitch (fine pitches correct);
+unified #0-80 to 3/4-16 from a table; unknown sizes are an ERROR with nothing
+cut; new `tap_drill_mm` override. Modeled threads: exact designation match, inch
+thread type for unified sizes, correct `createThreadInfo` argument order, and a
+WARNING with the reason when no match exists (no more `sizes[0]` fallback).
+
+### Fixed - component lookups
+Replaced 16 copies of an inline loop with injected `find_component` /
+`find_occurrence`. Occurrence names (`Screw:3`) address individual copies;
+misses and ambiguous component names raise with the valid names. 11 tools used
+to fall back to the root component silently on a miss.
+
+### Fixed - `run_batch(stop_on_error=True)` ignored reported failures
+Each op's output is captured; ERROR / WARNING / *** / FAILED / NOT CREATED /
+REFUSED / MISMATCH / UNCONFIRMED stops the batch. A tool rejecting its own
+arguments now fails the batch with that tool's message.
+
+### Fixed - hole tools ignored `body_index`
+`drill_hole`, `tapped_hole` and `hole_on_face` set `participantBodies`.
+
+### Fixed - `launch.bat` could not find `python` without the `py` launcher
+`%ERRORLEVEL%` inside a `( )` block expands at parse time; now `if not
+errorlevel 1`. Exit code is propagated.
+
+### Fixed - timeout message named the previous job
+`_last_job_id` is cleared before each request.
+
+### Smaller fixes
+- Code is no longer re-indented by `run_fusion_code_safe` / `run_batch` (it
+  rewrote multi-line strings); each runs as a compiled string. `_indent` removed.
+- Silent defaults are now errors: joint `motion`/`axis`, offset-plane `base`,
+  `fillet_edges`/`fillet_edges_smart` `which`, STL `quality`, empty
+  `box_in_component` name.
+- `move_component` keeps rotation; `copy_component` copies keep the source's.
+- `fillet_edges_smart` / `fillet_preview` gained `component_name` and build the
+  fillet in the body's own component.
+- Sliver threshold 0.05 mm² in `shell_body` and `get_model_state` (was 0.01).
+- `fillet_edges` no-match is a WARNING (was WARN, which nothing treated as
+  trouble).
+- `construction_plane_tangent` names and hides its reference sketch.
+- `view_model` uses a per-call temp file.
+- Same-named open documents are no longer both marked active (`get_state`,
+  `document_report`); an unresolvable tie shows `?`.
+- The watchdog exits on Stop (it leaked a thread per Stop → Run).
+- Fillet-error hint referenced a nonexistent `sweep_tube()`.
+- Dead second `return` in `list_edges`.
+- `launch.py`: checks protocol/version/token; finds the server path anywhere in
+  the config args; `serve` uses a subprocess on Windows (execv broke MCP
+  Inspector's stdio); reads the config as UTF-8; points at docs/INSTALL.md.
+
+### Project
+- `tests/` (178 tests, no Fusion needed) and a GitHub Actions workflow
+  (Windows + Linux, Python 3.10 / 3.12).
+- `docs/render_pdfs.py` reads the version from the server.
+- Generated PDFs untracked (`docs/pdf/` ignored); attach them to releases.
+- `mcp[cli]>=1.2.0,<2`.
+
+
 ## 1.8.1
 
 Two regressions found by stress-testing 1.7.0/1.8.0 rather than assuming they

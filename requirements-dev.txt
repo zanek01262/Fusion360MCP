@@ -1,0 +1,5 @@
+# Everything needed to run the test suite (no Fusion 360 required):
+#   python -m pip install -r requirements-dev.txt
+#   python -m pytest
+-r requirements.txt
+pytest>=7

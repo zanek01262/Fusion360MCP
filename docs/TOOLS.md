@@ -40,9 +40,11 @@ rebuilds). Same injected helpers and unit rules. Call `progress(msg)` in your
 code to mark stages visible while it runs.
 
 ### `job_status(job_id)`
-Structured result of an async job: `status` (queued/running/ok/error/timeout),
+Structured result of an async job: `status` (queued/running/ok/error),
 `elapsed_ms`, stdout collected **so far** (works mid-run), and traceback on
-failure. Poll until status is ok/error/timeout.
+failure. Poll until status is ok or error. A job that runs past its budget is
+flagged `budget_exceeded` but **keeps running and still ends in ok/error** —
+the flag is not a failure, so don't re-issue the job.
 
 ### `run_fusion_code(code)`
 Execute arbitrary Python in Fusion via the **bounded sync path**: waits up to
@@ -92,8 +94,14 @@ report_volume_delta(_b, 'mycut'); assert_scale()
 parametric edits / `offsetFeatures` / shell instead.
 
 ### `run_fusion_code_safe(code)`
-Transactional `run_fusion_code`: records the timeline marker and, on error,
-rolls back and deletes features created after it. Same injected helpers.
+Transactional `run_fusion_code`: records the timeline position and, on error,
+deletes every feature the call created, then **verifies** the timeline is back
+where it started. Prints `ROLLED BACK` only when it is; otherwise
+`ROLLBACK INCOMPLETE` with what's left. Features that were already past a
+rolled-back marker are left alone. A direct-modelling document (no timeline)
+says `NO ROLLBACK`. Your code runs as-is — it isn't re-indented, so multi-line
+strings are untouched and traceback line numbers are yours. Same injected
+helpers.
 
 ### `clear_document()`
 Delete all bodies, sketches, and timeline features. Returns design to empty.
@@ -126,7 +134,8 @@ Rectangle on XY extruded up by height. Returns new body name.
 Circle on XY extruded up.
 
 ### `drill_hole(diameter_mm, x_mm, y_mm, depth_mm, body_index=0)`
-Cut a hole straight down from XY at (x, y) to depth.
+Cut a hole straight down from XY at (x, y) to depth. Cuts **only** body
+`body_index`; other bodies the hole passes through are untouched.
 
 ### `fillet_edges(radius_mm, body_index=0, which="all")`
 Round edges. `which`: `all` / `vertical` (vertical-running edges) / `top`
@@ -136,16 +145,21 @@ Round edges. `which`: `all` / `vertical` (vertical-running edges) / `top`
 Hollow to a wall thickness. `open_top=True` removes the top face (open box);
 `False` makes a closed hollow body.
 
-### `tapped_hole(thread_size, x_mm, y_mm, depth_mm, body_index=0, tap_drill_only=True)`
-Tapped hole on the top (XY) plane, cutting down. `thread_size` e.g. `M3`,
-`M3x0.5`, `M4`, `M5`, `M6`, `1/4-20`, `10-32`, `#6-32`.
-- `tap_drill_only=True` (default): cuts only the correctly-sized tap-drill
-  clearance hole — best for 3D-printed and hand-tapped parts.
-- `False`: also applies a **modeled** thread (visualization / CNC); best-effort,
-  may be skipped with a warning if Fusion can't match the designation.
-Known tap-drill sizes include metric M1.6–M12 and common imperial; unknown
-sizes fall back to M3's drill — pass an explicit size you know is in the table,
-or ask to extend it.
+### `tapped_hole(thread_size, x_mm, y_mm, depth_mm, body_index=0, tap_drill_only=True, tap_drill_mm=None)`
+Tapped hole on the top (XY) plane, cutting down into body `body_index` only.
+`thread_size` is case-insensitive: `M3`, `m4`, `M4x0.7`, `M8x1`, `#6-32`,
+`10-32`, `1/4-20`, `1/4-20 UNC`.
+- **Metric:** drill = major − pitch, so any pitch works (`M8x1` → 7.0 mm). The
+  standard coarse sizes M1.6–M12 use the stock tap drills (M8 → 6.8 mm). A size
+  without a standard coarse pitch needs the pitch given (`M17x1.5`).
+- **Unified:** #0-80 through 3/4-16, from a tap-drill table.
+- **Anything else is an ERROR and nothing is cut** — it never guesses. Pass
+  `tap_drill_mm` to size the hole yourself.
+- `tap_drill_only=True` (default): cuts only the tap-drill hole — best for
+  3D-printed and hand-tapped parts.
+- `False`: also applies a **modeled** thread (visualization / CNC). If Fusion
+  has no matching designation it prints a `WARNING` with the reason; the
+  tap-drill hole is still cut.
 
 ---
 
@@ -185,7 +199,7 @@ Example: `cross_section(axis="z", at_mm=10, span_axis="x")` → reads off wall
 positions along X at Z=10 mm.
 
 
-### `fillet_edges_smart(radius_mm, body_index=0, which="all", min_radius_mm=0.2)`
+### `fillet_edges_smart(radius_mm, body_index=0, which="all", min_radius_mm=0.2, edge_tempids="", component_name="")`
 Fillet that **searches** for a working configuration: for each radius (halving
 down to `min_radius_mm`) it tries tangent-chain on then off, verifies the volume
 delta against `~0.1*r^2*L`, rolls back an overshoot, and reports which
@@ -224,6 +238,19 @@ Reposition the camera without returning an image.
 
 ## Components & occurrences
 
+A **component** is a part definition; an **occurrence** is one placed instance
+of it, named like `Screw:1`, `Screw:2` (shown by `list_components`). Copies
+made by `copy_component` share one component, so:
+
+- Tools that act on **one placed part** (`move_component`, `ground_component`,
+  the joint tools) take an **occurrence name** (`Screw:3`) — or a component
+  name only when exactly one occurrence uses it. An ambiguous name is an ERROR
+  listing the occurrence names to choose from.
+- Tools that act on the **definition** (`box_in_component`, and every
+  `component_name=` parameter) accept either.
+- A name that matches nothing is an ERROR listing what exists — it never falls
+  back to the root component.
+
 ### `create_component(name)`
 New empty component as an occurrence at the origin. One per distinct part.
 
@@ -231,17 +258,21 @@ New empty component as an occurrence at the origin. One per distinct part.
 All occurrences: fullPathName, component name, origin position (mm).
 
 ### `box_in_component(component_name, length_mm, width_mm, height_mm, ox_mm=0, oy_mm=0, oz_mm=0)`
-Box built inside a named component on its own XY plane.
+Box built inside a named component on its own XY plane. `component_name` is
+required.
 
 ### `move_component(component_name, x_mm, y_mm, z_mm)`
-Translate an occurrence's origin. Position BEFORE jointing.
+Translate one occurrence's origin, **keeping its rotation**. Position BEFORE
+jointing.
 
 ### `copy_component(component_name, count, dx_mm=0, dy_mm=0, dz_mm=0)`
-Place `count` more occurrences of one definition in a linear pattern. Reuses
-the definition (edit once, all update) — ideal for repeated hardware.
+Place `count` more occurrences of one definition in a linear pattern, with the
+source's rotation. Reuses the definition (edit once, all update) — ideal for
+repeated hardware. Address the copies by occurrence name afterwards.
 
 ### `ground_component(component_name, grounded=True)`
-Lock/unlock a component in space. Ground exactly one base per assembly, first.
+Lock/unlock one occurrence in space. Ground exactly one base per assembly,
+first.
 
 ---
 
@@ -382,7 +413,9 @@ the plane 10× too far and makes subsequent embosses silently no-op.
 ### `construction_plane_tangent(angle_deg=0.0, body_index=0, component_name="")`
 Plane tangent to the largest curved face at an angle around its axis. The
 reliable way to place sketches for **multi-sector wraps** on revolved bodies.
-Echoes world position/normal.
+Echoes world position/normal. The plane is built from a sketch point, so each
+call leaves one **hidden reference sketch** named `mcp_tangent_ref_<angle>deg`;
+the plane depends on it, so don't delete it.
 
 ### `sketch_axis_map(sketch_index=-1, component_name="")`
 Probe a sketch's local→world mapping via `sketchToModelSpace` and print where
@@ -450,14 +483,15 @@ paste into `fillet_edges_smart(edge_tempids=...)`.
 `list_edges` now reports the same **surface-type pair** per edge, so you don't
 have to re-implement the classifier.
 
-### `fillet_preview(radius_mm, edge_tempids, body_index=0)`
+### `fillet_preview(radius_mm, edge_tempids, body_index=0, component_name="")`
 What a fillet *would* touch, before committing: selected edges, adjacent faces,
 and any face smaller than **~4r²** — the signature of a radius too large for the
 feature it lands on, which is how a fillet silently **consumes** a narrow
 feature (a 1.3 mm rim annulus, say) while the volume delta still looks fine.
 
-### `fillet_edges_smart(radius_mm, body_index=0, which="all", min_radius_mm=0.2, edge_tempids="")`
-Searches radius × tangent-chain and verifies **two** ways:
+### `fillet_edges_smart(radius_mm, body_index=0, which="all", min_radius_mm=0.2, edge_tempids="", component_name="")`
+Pass the same `component_name` you gave `select_edges`, or its tempIds won't
+resolve. Searches radius × tangent-chain and verifies **two** ways:
 - **Volume** — delta vs `~0.1·r²·L`, catching a blend that propagated and *added*
   geometry far away.
 - **Topology** — which faces *disappeared*, warning when a face smaller than
@@ -503,7 +537,15 @@ ONE round trip and one Fusion job. Only **geometry and parameter** tools are
 batchable (an explicit allowlist). Reporting, async and document-level tools —
 `clear_document`, `save_document`, `view_model`, `document_report`, … — must be
 called directly so their results and safety checks are not swallowed. An invalid
-batch is rejected before anything executes.
+batch — including one whose tool rejects its own arguments — is rejected before
+anything executes, with that tool's message.
+
+`stop_on_error=True` stops at the first op that **raises or reports a
+failure** in its output (`ERROR`, `WARNING`, `***`, `FAILED`, `NOT CREATED`,
+`REFUSED`, `MISMATCH`, `UNCONFIRMED`) — most tools report failure by printing,
+not raising. `False` runs every op and lists the ones that failed or were
+flagged. Each op runs as its own compiled string, so `run_fusion_code` ops are
+not re-indented.
 
 ## Verification guarantees (what "success" means)
 
@@ -515,10 +557,12 @@ These are now checked rather than assumed:
 |---|---|
 | Any geometry tool | The active product **is a Design**. In a Drawing/CAM/Render workspace you get a clear error naming the workspace and document, not an obscure `.rootComponent` failure. |
 | `save_document` | Version bump / modified-flag cleared / lineage appeared → **CONFIRMED**, else **UNCONFIRMED**. |
-| `export_step` / `export_stl` / `export_dxf` | `execute()` return **and** the file exists with non-zero size → **CONFIRMED**, else an explicit failure. |
+| `export_step` / `export_stl` / `export_dxf` | The export call's return value, **and** the file was written by *this* call (its modification time changed) with non-zero size → **CONFIRMED**. A file left at the path by an earlier export no longer passes. |
 | `set_parameter` | The stored expression is **read back** and compared. Fusion silently rejects or clamps expressions it dislikes. |
 | `rigid_joint` / `revolute_joint` / `joint_at_point` | Joint **count increased**. |
-| `drill_hole` / `hole_on_face` / `tapped_hole` / `shell_body` | Volume delta, with a no-op warning. |
+| `drill_hole` / `hole_on_face` / `tapped_hole` / `shell_body` | Volume delta, with a no-op warning. Holes cut only the target body. `tapped_hole` refuses a size it can't look up rather than guessing a drill. |
+| `run_fusion_code_safe` | After a failure, the timeline count is back where it started → **ROLLED BACK**, else **ROLLBACK INCOMPLETE**. |
+| Component / occurrence names | Resolved or refused — never a silent fallback to the root component or to the first of several copies. |
 | `fillet_edges` / `fillet_edges_smart` | Volume delta **and** face topology (consumed faces). |
 | `cut_prisms` | Volume delta. |
 | `clear_document` | States the target **document name and lineage before destroying anything**. |
@@ -670,7 +714,7 @@ channel, so you can always tell what's happening:
 1. `heartbeat()` (or `ping_fusion()`). If it responds with `busy=True`, a job is
    still running — `job_status(current_job)` for its partial output. If it
    errors/times out, the listener is down.
-2. If a `run_fusion_code` call returned "STILL RUNNING" or a timeout envelope,
+2. If a `run_fusion_code` call returned "STILL RUNNING" or `budget_exceeded`,
    the job kept going — poll `job_status(job_id)` rather than re-issuing it
    (re-issuing stacks another job behind the stuck one).
 3. `get_state()` is always cheap and never blocks — use it to see the active
@@ -678,6 +722,11 @@ channel, so you can always tell what's happening:
 4. If the listener is truly down: in Fusion, **Shift+S → Add-Ins → MCPListener →
    Run** to restart it, then `get_state()` to see what survived.
 
-A job that exceeds its budget is flagged `timeout` in the envelope (the
+A job that exceeds its budget is flagged `budget_exceeded` in the envelope (the
 watchdog can't force-kill a hung main thread, but you get a clear signal instead
-of a dead channel).
+of a dead channel). The status still moves to OK or ERROR when the job ends, so
+you learn whether it actually completed.
+
+5. If a tool returns **AUTH ERROR**, the listener rejected the auth token —
+   usually Fusion and Claude Desktop are running as different OS users, or
+   the token file was deleted. Stop → Run the add-in; it writes a fresh token.

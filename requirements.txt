@@ -5,5 +5,7 @@
 # Fusion's bundled Python and the standard library. These deps are only for the
 # MCP server that Claude Desktop launches.
 
-mcp[cli]>=1.2.0
+# Capped below the next major: FastMCP's decorator and Image API could
+# change there, and an unpinned upgrade would break the server silently.
+mcp[cli]>=1.2.0,<2
 requests>=2.31.0

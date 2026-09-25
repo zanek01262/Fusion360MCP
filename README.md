@@ -100,12 +100,13 @@ You just keep Fusion open with the add-in running.
 | `fusion_mcp_server.py` | The MCP server **Claude Desktop launches**. |
 | `launch.py` / `launch.sh` / `launch.bat` | Preflight health-checker. |
 | `docs/claude_project_instructions.md` | Paste into a Claude Project to teach it the conventions. |
-| `RELEASE_NOTES.md` | Notes for the current release (v1.8.1) — covers everything since v1.4.1. |
+| `RELEASE_NOTES.md` | Notes for the current release (v1.9.0). |
 | `CHANGELOG.md` | Full per-version history. |
 | `requirements.txt` | Python dependencies. |
+| `requirements-dev.txt` | Adds `pytest`, for the test suite. |
+| `tests/` | Test suite. Needs no Fusion: `python -m pytest`. CI runs it on every push. |
 | `docs/INSTALL.md` | Step-by-step install + troubleshooting. |
-| `docs/pdf/` | Print-ready PDFs of every doc (plus `ALL-DOCS` combined). |
-| `docs/render_pdfs.py` | Regenerates those PDFs after you edit the markdown. |
+| `docs/render_pdfs.py` | Builds print-ready PDFs of every doc (plus an `ALL-DOCS` volume) into `docs/pdf/`. The PDFs are attached to each GitHub release rather than committed. |
 | `docs/TOOLS.md` | Reference for every tool. |
 | `docs/ARCHITECTURE.md` | How the pieces fit, for the curious / for hacking. |
 | `LICENSE` | MIT. |
@@ -115,8 +116,10 @@ You just keep Fusion open with the add-in running.
 ## A few honest caveats
 
 - The listener executes arbitrary Python sent to **localhost only**
-  (`127.0.0.1:8765`). That's required for it to work, but don't expose that
-  port to a network. See ARCHITECTURE for the security model.
+  (`127.0.0.1:8765`). That's required for it to work. Since v1.9.0 every
+  request must also carry a random per-session token that only your user
+  account can read, so a web page in your browser can't use the port. Don't
+  expose that port to a network. See ARCHITECTURE for the security model.
 - The canned tools assume principal planes and box-like geometry for face
   selection. Complex/organic shapes use the raw-code escape hatch — Claude
   knows when to switch.

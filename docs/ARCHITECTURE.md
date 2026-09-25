@@ -57,10 +57,13 @@ answered entirely from cached data on the HTTP thread. So even while a geometry
 call churns (or hangs) on the main thread, liveness and cheap document state stay
 responsive. This is what makes "is it busy or dead?" answerable.
 
-**A watchdog flags overruns.** A background thread marks any job that exceeds its
-budget as `status: timeout`. It can't force-kill a hung main thread (Fusion's API
-has no such hook), but the caller gets an immediate, unambiguous signal instead
-of a dead socket.
+**A watchdog flags overruns.** A background thread sets `budget_exceeded` on any
+job that runs past its budget. It can't force-kill a hung main thread (Fusion's
+API has no such hook), but the caller gets an immediate, unambiguous signal
+instead of a dead socket. It only *flags*: the status still moves to `ok` or
+`error` when the job ends, so the caller learns whether a long operation
+actually landed instead of retrying one that had completed. The thread exits
+when the add-in stops.
 
 **Sync path for convenience.** `POST /exec_sync` enqueues then waits up to
 `wait_s` and returns the envelope — used by `run_fusion_code` for short ops. If
@@ -77,31 +80,50 @@ to Claude and divides by 10 before talking to the API. When writing raw code via
 
 ## The safety wrapper
 
-`run_fusion_code_safe` records the timeline marker position, runs your code, and
-on exception rolls the timeline back and deletes any features created after the
-marker — leaving the document as it was. It's effective on parametric documents
-(design history on, the default). Direct-modeling docs have no timeline to roll
-back, so it degrades to plain error reporting.
+`run_fusion_code_safe` records the timeline count and marker position, runs your
+code as a compiled string (never re-indented, so strings and traceback line
+numbers are untouched), and on exception deletes the features the call created —
+via `timeline.item(i).entity.deleteMe()`, since a timeline item itself has no
+`deleteMe`. It then checks the timeline count is back where it started and says
+`ROLLED BACK` only if it is (`ROLLBACK INCOMPLETE` otherwise). It's effective on
+parametric documents (design history on, the default). Direct-modeling docs have
+no timeline; the wrapper says `NO ROLLBACK` rather than implying one happened.
 
 ## Visual feedback
 
 `view_model` orients the camera, fits, saves a PNG via
 `Viewport.saveAsImageFile`, reads the bytes back, and returns them as an MCP
 `Image`. Because the MCP server and Fusion are on the same machine, the file
-round-trips through `~/fusion_view.png`. (This is the one tool that assumes
-shared local disk.)
+round-trips through a per-call temp file that is deleted afterwards. (This is
+the one tool that assumes shared local disk.)
 
 ## Security model
 
-- The listener binds to **`127.0.0.1` only** — not reachable off-machine.
-- It does, by design, **execute arbitrary Python** it receives. That's the whole
-  mechanism. The trust boundary is: only your local MCP server (driven by your
-  Claude Desktop) talks to it.
-- **Do not** change the bind address to `0.0.0.0` or forward the port. Doing so
-  would let anything on your network run code in your Fusion session.
-- There's no authentication on the localhost channel; it relies on the OS
-  loopback boundary. Fine for a personal machine, not for a shared/multi-user
-  host.
+The listener **executes arbitrary Python** it receives — that's the whole
+mechanism — so who can reach it is the entire security question.
+
+- **Bound to `127.0.0.1` only**, so it isn't reachable off-machine.
+- **Loopback alone is not enough.** A web page open in your browser can send a
+  POST to `127.0.0.1:8765`: a `text/plain` request needs no CORS preflight, so
+  the browser sends it without asking. Before 1.9.0 the listener executed such
+  a request. A DNS-rebinding site can reach it too, under its own hostname.
+- **Two checks now guard every request:**
+  1. **Host header must be `127.0.0.1` or `localhost`.** Refuses DNS rebinding,
+     where the Host is the attacker's domain.
+  2. **`X-MCP-Token` header must match a random token** the listener writes at
+     startup to `~/.fusion_mcp/listener_token` (user-only permissions; a new
+     token every time the add-in starts). The server reads that file on every
+     request. A web page can't read the file, and a custom header forces a CORS
+     preflight that the listener never approves — so a page can't even send
+     the request.
+  `GET /ping` skips the token (liveness and version only, no document data), so
+  the preflight and a stale server can still diagnose a version mismatch.
+- **Other local users** can't read your token file, so they can't drive your
+  Fusion session either. A process running as *you* can, but it could already
+  do anything you can.
+- **Do not** change the bind address to `0.0.0.0` or forward the port.
+- The dangerous-call refusals in `_DANGEROUS_PATTERNS` are a **stability**
+  guard against host crashes, not a security boundary.
 
 ## Extending the toolset
 
@@ -111,12 +133,22 @@ want Claude to see, and return `_send(code)`. Patterns to copy:
 
 - **Take mm, convert to cm** at the top (`x = x_mm / 10.0`).
 - **`print()` a clear success line** — that string is what Claude reads back.
-- **Guard lookups** (component/body not found) and print an `ERROR: ...` line
-  rather than throwing, so Claude gets a readable message.
-- For multi-step features, consider routing through the same rollback idea as
-  `run_fusion_code_safe`.
+- **Resolve components with `find_component(name)` / `find_occurrence(name)`**
+  (injected helpers). They raise with a list of valid names on a miss; never
+  loop over occurrences yourself and fall back to the root.
+- **Validate arguments server-side** and return an `ERROR: ...` string before
+  generating any code, rather than defaulting an unknown value silently.
+- **Report failure with a marker** (`ERROR`, `WARNING`, `***`) — `run_batch`
+  stops on those, and terse mode never hides them.
+- If the tool is a pure geometry/parameter operation, add it to `BATCHABLE`.
+- Run `python -m pytest`: it compiles every tool's generated code, so a quoting
+  or `.format()` slip in a template fails the build instead of failing inside
+  Fusion.
 
 Restart Claude Desktop after editing the server so it reloads the tool list.
+If you change the wire format, bump `PROTOCOL` in `MCPListener.py` **and**
+`EXPECTED_PROTOCOL` in the server; bump the version in both for every release
+(`tests/test_versions.py` enforces it).
 
 ## Files
 
@@ -125,3 +157,4 @@ Restart Claude Desktop after editing the server so it reloads the tool list.
 | `MCPListener.py` | Inside Fusion | HTTP listener + main-thread executor |
 | `fusion_mcp_server.py` | Spawned by Claude Desktop | MCP tools → HTTP relay |
 | `launch.py` | Your terminal | Preflight/health checks only |
+| `tests/` | Your terminal / CI | Test suite — needs no Fusion (`python -m pytest`) |

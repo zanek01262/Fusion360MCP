@@ -22,3 +22,7 @@ desktop.ini
 # Local config that may contain machine-specific paths — never commit secrets
 # or absolute user paths by accident:
 claude_desktop_config.local.json
+
+# Generated PDFs - built by docs/render_pdfs.py and attached to each GitHub
+# release instead of committed (they added ~1 MB of binaries per doc edit)
+docs/pdf/

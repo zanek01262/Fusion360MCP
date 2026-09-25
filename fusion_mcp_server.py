@@ -19,6 +19,8 @@ run_fusion_code / run_fusion_code_safe, remember the API is in CM.
 """
 
 import os
+import re
+import tempfile
 import requests
 from mcp.server.fastmcp import FastMCP, Image
 
@@ -57,8 +59,41 @@ def _compact(text: str) -> str:
         kept.append("({} detail line(s) hidden - set_verbosity('full') to show)"
                     .format(dropped))
     return "\n".join(kept)
-SERVER_VERSION = "1.8.1"
-EXPECTED_PROTOCOL = 2
+# The one version number. MCPListener.LISTENER_VERSION must match (the
+# listener lives in a separate folder, so it cannot import this);
+# tests/test_versions.py fails the build if any copy drifts.
+SERVER_VERSION = "1.9.0"
+EXPECTED_PROTOCOL = 3
+
+# Auth token the listener writes at startup (see MCPListener.py). Read fresh on
+# every request: the listener makes a new one each time the add-in starts, so a
+# cached copy would go stale after a Stop -> Run.
+TOKEN_PATH = os.path.join(os.path.expanduser("~"), ".fusion_mcp", "listener_token")
+TOKEN_HEADER = "X-MCP-Token"
+
+
+def _headers() -> dict:
+    try:
+        with open(TOKEN_PATH, encoding="utf-8") as f:
+            return {TOKEN_HEADER: f.read().strip()}
+    except OSError:
+        return {}
+
+
+def _refused(r) -> str:
+    """Explain a 401/403 from the listener; '' if the request was accepted."""
+    if r.status_code == 403:
+        return ("AUTH ERROR: the listener refused this request's Host header. "
+                "LISTENER_URL must point at 127.0.0.1 or localhost.")
+    if r.status_code == 401:
+        where = ("exists but does not match - it is from an earlier run"
+                 if os.path.exists(TOKEN_PATH) else "does not exist")
+        return ("AUTH ERROR: the listener rejected the auth token. The token "
+                "file {} {}. FIX: in Fusion press Shift+S > Add-Ins > "
+                "MCPListener > Stop > Run (that rewrites the token), and make "
+                "sure Fusion and Claude Desktop run as the same OS user."
+                .format(TOKEN_PATH, where))
+    return ""
 
 MISMATCH_MSG = (
     "PROTOCOL MISMATCH: the MCPListener add-in running inside Fusion is an OLD "
@@ -93,6 +128,7 @@ def _fmt_envelope(data: dict) -> str:
     status = data.get("status", "ok" if data.get("ok") else "error")
     elapsed = data.get("elapsed_ms")
     jid = data.get("job_id")
+    over = data.get("budget_exceeded")
     head = "STATUS: {}".format(status.upper())
     if elapsed is not None:
         head += "  ({} ms)".format(elapsed)
@@ -107,12 +143,15 @@ def _fmt_envelope(data: dict) -> str:
     tb = data.get("traceback", "")
     if tb:
         parts.append("TRACEBACK:\n" + tb.rstrip())
-    if status == "timeout":
-        parts.append("NOTE: the listener flagged this as TIMEOUT - the operation "
-                     "exceeded its budget. It may still be running in Fusion. "
-                     "Call job_status('{}') to check, or heartbeat() for "
-                     "liveness.".format(jid))
-    if status == "running":
+    if over and status == "running":
+        parts.append("NOTE: this job has run past its {}s budget and is STILL "
+                     "RUNNING in Fusion - it has not failed. Poll job_status('{}'):"
+                     " the status changes to OK or ERROR when it ends. Do NOT "
+                     "re-issue it.".format(data.get("budget_s"), jid))
+    elif over:
+        parts.append("NOTE: finished after running past its {}s budget. The "
+                     "status above is the final result.".format(data.get("budget_s")))
+    elif status == "running":
         parts.append("NOTE: still running. Poll job_status('{}') for the final "
                      "result; partial stdout shown above.".format(jid))
     return "\n".join(parts)
@@ -138,6 +177,13 @@ BATCHABLE = {
 }
 
 
+# Output text that means an op FAILED even though it did not raise - most tools
+# report failure by printing. Case-sensitive on purpose: lowercase counters
+# such as "failed=0" or "no-op=0" in a clean summary must not trip it.
+_BATCH_STOP_MARKERS = ("ERROR", "WARNING", "***", "FAILED", "NOT CREATED",
+                       "REFUSED", "MISMATCH", "UNCONFIRMED", "Traceback")
+
+
 def _send(code: str, compact: bool = True) -> str:
     """Run code via the listener's sync path (bounded wait). Returns a structured
     envelope string. If the job outlives SYNC_WAIT_S it stays pollable via
@@ -148,10 +194,16 @@ def _send(code: str, compact: bool = True) -> str:
         # it, so N operations become ONE main-thread job / ONE round trip.
         _batch_buf.append(code)
         return "BATCHED"
+    # If this request times out, the NEW job's id never arrives. Clear the old
+    # one so the timeout message cannot point job_status at the previous job.
+    _last_job_id[0] = None
     try:
         r = requests.post(LISTENER_URL + "/exec_sync",
                           json={"code": code, "wait_s": SYNC_WAIT_S},
-                          timeout=HTTP_TIMEOUT_S)
+                          headers=_headers(), timeout=HTTP_TIMEOUT_S)
+        refused = _refused(r)
+        if refused:
+            return refused
         data = r.json()
         if data.get("job_id"):
             _last_job_id[0] = data["job_id"]
@@ -199,7 +251,11 @@ def _send_async(code: str) -> str:
         # queued for later.
         raise RuntimeError("this tool uses the async path and cannot be batched")
     try:
-        r = requests.post(LISTENER_URL + "/exec", json={"code": code}, timeout=10)
+        r = requests.post(LISTENER_URL + "/exec", json={"code": code},
+                          headers=_headers(), timeout=10)
+        refused = _refused(r)
+        if refused:
+            return refused
         d = r.json()
         pm = _check_protocol(d)
         if pm:
@@ -213,13 +269,6 @@ def _send_async(code: str) -> str:
         return "CONNECTION ERROR: {}".format(e)
 
 
-def _indent(text: str, spaces: int) -> str:
-    """Indent a code block so it can be nested inside a try: in the safe wrapper."""
-    pad = " " * spaces
-    return "\n".join(pad + line if line.strip() else line
-                     for line in text.splitlines())
-
-
 # ==========================================================================
 # CORE
 # ==========================================================================
@@ -230,7 +279,10 @@ def ping_fusion() -> str:
     while a long operation is running on Fusion's main thread (a hung op no
     longer blocks ping). Reports busy state and which job is current."""
     try:
-        r = requests.get(LISTENER_URL + "/ping", timeout=5)
+        r = requests.get(LISTENER_URL + "/ping", headers=_headers(), timeout=5)
+        refused = _refused(r)
+        if refused:
+            return refused
         d = r.json()
         pm = _check_protocol(d)
         if pm:
@@ -262,7 +314,10 @@ def get_state() -> str:
     user may have switched documents in the Fusion UI since the snapshot. Call
     document_report() for an authoritative live read before any save or clear."""
     try:
-        r = requests.get(LISTENER_URL + "/state", timeout=5)
+        r = requests.get(LISTENER_URL + "/state", headers=_headers(), timeout=5)
+        refused = _refused(r)
+        if refused:
+            return refused
         d = r.json()
         pm = _check_protocol(d)
         if pm:
@@ -275,6 +330,9 @@ def get_state() -> str:
             lines.append("*** STALE - the active document may have changed in the "
                          "Fusion UI. Use document_report() before saving/clearing. ***")
         lines.append("active_document: {}".format(d.get("active_document")))
+        if any(x.get("active") is None for x in (d.get("open_documents") or [])):
+            lines.append("NOTE: several open documents share the active name (marked ?) "
+                         "- run document_report() before saving or clearing.")
         lines.append("lineage_id: {}".format(d.get("lineage_id")))
         lines.append("is_saved_flag={} is_modified={} version={} data_ok={}".format(
             d.get("is_saved_flag"), d.get("is_modified"),
@@ -287,8 +345,9 @@ def get_state() -> str:
         if docs:
             lines.append("open documents ({}):".format(len(docs)))
             for x in docs:
+                act = x.get("active")
                 lines.append("  {} {}  saved_flag={} modified={} lineage={}".format(
-                    "*" if x.get("active") else " ", x.get("name"),
+                    "*" if act else ("?" if act is None else " "), x.get("name"),
                     x.get("is_saved_flag"), x.get("is_modified"),
                     x.get("lineage_id")))
         lines.append("bodies: {}  sketches: {}  components: {}  timeline: {}".format(
@@ -375,14 +434,32 @@ def document_report() -> str:
         "try:\n"
         "    n = app_.documents.count\n"
         "    print('OPEN DOCUMENTS (' + str(n) + '):')\n"
+        "    _docs = [app_.documents.item(i) for i in range(n)]\n"
+        "    _ids = [ident(d) for d in _docs]\n"
+        "    # names decide when unique; object equality breaks a tie between\n"
+        "    # same-named documents; otherwise say we cannot tell\n"
+        "    _named = [i for i in range(n) if _ids[i].get('name') == ai.get('name')]\n"
+        "    _act = _named[0] if len(_named) == 1 else None\n"
+        "    if len(_named) > 1:\n"
+        "        _same = []\n"
+        "        for i in _named:\n"
+        "            try:\n"
+        "                if _docs[i] == act:\n"
+        "                    _same.append(i)\n"
+        "            except Exception:\n"
+        "                pass\n"
+        "        _act = _same[0] if len(_same) == 1 else None\n"
         "    for i in range(n):\n"
-        "        d = app_.documents.item(i)\n"
-        "        o = ident(d)\n"
-        "        mark = '*' if o.get('name') == ai.get('name') else ' '\n"
+        "        o = _ids[i]\n"
+        "        if _act is not None:\n"
+        "            mark = '*' if i == _act else ' '\n"
+        "        else:\n"
+        "            mark = '?' if i in _named else ' '\n"
         "        print('  %s [%d] %s  saved=%s modified=%s lineage=%s'\n"
         "              % (mark, i, o.get('name'), o.get('saved_flag'),\n"
         "                 o.get('modified'), o.get('lineage')))\n"
-        "    print('  (* = active; use activate_document to switch)')\n"
+        "    print('  (* = active; ? = shares the active name, cannot tell which;'\n"
+        "          ' use activate_document to switch)')\n"
         "except Exception as _e:\n"
         "    print('could not enumerate open documents: ' + str(_e)[:70])\n"
     )
@@ -439,8 +516,15 @@ def run_async(code: str) -> str:
     blocks. Same injected helpers and units rules as run_fusion_code. Emit
     progress(msg) in your code to mark stages visible while it runs."""
     try:
-        r = requests.post(LISTENER_URL + "/exec", json={"code": code}, timeout=10)
+        r = requests.post(LISTENER_URL + "/exec", json={"code": code},
+                          headers=_headers(), timeout=10)
+        refused = _refused(r)
+        if refused:
+            return refused
         d = r.json()
+        pm = _check_protocol(d)
+        if pm:
+            return pm
         jid = d.get("job_id")
         return ("SUCCESS:\nstarted job {} (status: {}). Poll job_status('{}') "
                 "for progress and the final result.".format(jid, d.get("status"), jid))
@@ -450,16 +534,22 @@ def run_async(code: str) -> str:
 
 @mcp.tool()
 def job_status(job_id: str) -> str:
-    """Structured result of an async job: status (queued/running/ok/error/
-    timeout), elapsed time, stdout collected SO FAR (incremental), and traceback
-    on failure. Poll until status is ok/error/timeout.
+    """Structured result of an async job: status (queued/running/ok/error),
+    elapsed time, stdout collected SO FAR (incremental), and traceback on
+    failure. Poll until status is ok or error. A job that runs past its budget
+    is flagged budget_exceeded but keeps running and still ends in ok/error -
+    the flag is not a failure.
 
     POLL WITH BACKOFF, not tightly: each poll is a round trip and returns the
     whole accumulated stdout again. Roughly 5s, 10s, 20s, then every 30s. The
     response tells you the elapsed time so you can judge. get_state() stays
     responsive meanwhile and is cheaper if you only need liveness."""
     try:
-        r = requests.get(LISTENER_URL + "/job/" + str(job_id), timeout=5)
+        r = requests.get(LISTENER_URL + "/job/" + str(job_id),
+                         headers=_headers(), timeout=5)
+        refused = _refused(r)
+        if refused:
+            return refused
         if r.status_code == 404:
             return "ERROR: no such job_id {}".format(job_id)
         return _fmt_envelope(r.json())
@@ -472,7 +562,7 @@ def job_status(job_id: str) -> str:
 @mcp.tool()
 def run_fusion_code(code: str) -> str:
     """Execute arbitrary Python inside the running Fusion 360 session.
-    [server v1.8.1 - if this looks old, Claude Desktop is showing a CACHED tool
+    [server v1.9.0 - if this looks old, Claude Desktop is showing a CACHED tool
      schema; fully restart it.]
 
     `adsk`, `app`, `ui` are in scope, plus ~30 injected helpers. Fusion's API is
@@ -498,44 +588,73 @@ def run_fusion_code(code: str) -> str:
 def run_fusion_code_safe(code: str) -> str:
     """Transactional version of run_fusion_code.
 
-    Records the timeline marker first; if the code raises, rolls the timeline
-    back and deletes features created after the marker, leaving the document as
-    it was. Use for multi-step / risky operations so partial failures don't
-    leave orphaned geometry. Fully effective only on parametric documents
-    (design history enabled, the default).
+    Records the timeline position first; if the code raises, deletes every
+    feature the call created and VERIFIES the timeline is back where it
+    started - it prints ROLLED BACK only when it is, and ROLLBACK INCOMPLETE
+    otherwise. Use for multi-step / risky operations so partial failures don't
+    leave orphaned geometry. Parametric documents only (design history on, the
+    default): a direct-modelling document has no timeline, and says so.
 
     Same injected helpers as run_fusion_code (mm(), assert_scale(),
     total_volume(), report_volume_delta(), sliver_face_count(),
     log_sketch_areas(), delete_face()). Use mm() for inputs; never hand-divide.
     """
+    # The user's code runs as a compiled string, not re-indented into a try:
+    # block - indenting rewrote multi-line string literals and shifted every
+    # traceback line number. Wrapper names are _mcp_-prefixed so the user's
+    # code cannot clobber them.
     wrapped = (
-        "import traceback as _tb\n"
-        "design = _require_design()\n"
-        "_tl = None\n"
-        "_marker = 0\n"
+        "import traceback as _mcp_tb\n"
+        "_mcp_tl = None\n"
         "try:\n"
-        "    _tl = design.timeline\n"
-        "    _marker = _tl.markerPosition\n"
+        "    _mcp_tl = _require_design().timeline\n"
+        "    _mcp_count0 = _mcp_tl.count\n"
+        "    _mcp_marker0 = _mcp_tl.markerPosition\n"
         "except Exception:\n"
-        "    _tl = None\n"
+        "    _mcp_tl = None\n"
+        "_MCP_USER_CODE = " + repr(code) + "\n"
         "try:\n"
-        + _indent(code, 4) + "\n"
+        "    exec(compile(_MCP_USER_CODE, '<mcp>', 'exec'), globals())\n"
         "    print('[safe] committed')\n"
         "except Exception:\n"
-        "    _msg = _tb.format_exc()\n"
-        "    if _tl is not None:\n"
-        "        try:\n"
-        "            _cur = _tl.markerPosition\n"
-        "            for _i in range(_cur - 1, _marker - 1, -1):\n"
-        "                if 0 <= _i < _tl.count:\n"
-        "                    try:\n"
-        "                        _tl.item(_i).deleteMe()\n"
-        "                    except Exception:\n"
-        "                        pass\n"
-        "            print('[safe] ROLLED BACK after error')\n"
-        "        except Exception as _re:\n"
-        "            print('[safe] rollback partial: ' + str(_re))\n"
-        "    raise Exception(_msg)\n"
+        "    _mcp_msg = _mcp_tb.format_exc()\n"
+        "    if _mcp_tl is None:\n"
+        "        print('[safe] *** NO ROLLBACK: this document has no timeline '\n"
+        "              '(direct modelling) - any partial changes remain. ***')\n"
+        "    else:\n"
+        "        # New features are inserted AT the marker, so this call's own\n"
+        "        # features occupy [marker0, marker0 + n). Anything that was\n"
+        "        # already past a rolled-back marker is not ours and is kept.\n"
+        "        _mcp_n = _mcp_tl.count - _mcp_count0\n"
+        "        _mcp_fail = []\n"
+        "        for _mcp_i in range(_mcp_marker0 + _mcp_n - 1, _mcp_marker0 - 1, -1):\n"
+        "            try:\n"
+        "                # TimelineObject has no deleteMe - delete its entity\n"
+        "                _mcp_ent = _mcp_tl.item(_mcp_i).entity\n"
+        "                if _mcp_ent is None:\n"
+        "                    _mcp_fail.append('index %d: no entity' % _mcp_i)\n"
+        "                else:\n"
+        "                    _mcp_ent.deleteMe()\n"
+        "            except Exception as _mcp_e:\n"
+        "                _mcp_fail.append('index %d: %s' % (_mcp_i, str(_mcp_e)[:60]))\n"
+        "        _mcp_left = _mcp_tl.count - _mcp_count0\n"
+        "        if _mcp_n < 0:\n"
+        "            print('[safe] *** this call DELETED %d feature(s) before failing;'\n"
+        "                  ' rollback cannot restore deleted features. ***' % -_mcp_n)\n"
+        "        elif _mcp_n == 0:\n"
+        "            print('[safe] nothing to roll back - the error came before any '\n"
+        "                  'feature was created')\n"
+        "        elif _mcp_left <= 0:\n"
+        "            print('[safe] ROLLED BACK after error: removed %d feature(s), '\n"
+        "                  'timeline is back to %d item(s)' % (_mcp_n, _mcp_tl.count))\n"
+        "        else:\n"
+        "            print('[safe] *** ROLLBACK INCOMPLETE: %d of %d feature(s) '\n"
+        "                  'created by this call are still in the timeline. Inspect '\n"
+        "                  'with get_model_state before continuing. ***'\n"
+        "                  % (_mcp_left, _mcp_n))\n"
+        "            for _mcp_f in _mcp_fail[:5]:\n"
+        "                print('       ' + _mcp_f)\n"
+        "    raise Exception(_mcp_msg)\n"
     )
     return _send(wrapped)
 
@@ -737,12 +856,15 @@ def create_cylinder(diameter_mm: float, height_mm: float,
 def drill_hole(diameter_mm: float, x_mm: float, y_mm: float,
                depth_mm: float, body_index: int = 0) -> str:
     """Cut a circular hole straight down (-Z) from the XY plane at (x, y) to the
-    given depth. For holes on other faces use sketch_on_face + hole_on_face."""
+    given depth. Cuts only body `body_index` - other bodies the hole passes
+    through are left alone. For holes on other faces use sketch_on_face +
+    hole_on_face."""
     R, D = diameter_mm / 20.0, depth_mm / 10.0
     x, y = x_mm / 10.0, y_mm / 10.0
     code = (
         "design = _require_design()\n"
         "root = design.rootComponent\n"
+        "body = root.bRepBodies.item({bi})\n"
         "_before = sum((b.volume if b.isValid else 0) for b in root.bRepBodies)\n"
         "sk = root.sketches.add(root.xYConstructionPlane)\n"
         "ctr = adsk.core.Point3D.create({x}, {y}, 0)\n"
@@ -751,13 +873,16 @@ def drill_hole(diameter_mm: float, x_mm: float, y_mm: float,
         "ext = root.features.extrudeFeatures\n"
         "inp = ext.createInput(prof, adsk.fusion.FeatureOperations.CutFeatureOperation)\n"
         "inp.setDistanceExtent(False, adsk.core.ValueInput.createByReal(-{D}))\n"
+        "# Without this Fusion cuts EVERY body the hole crosses (lid and\n"
+        "# enclosure together), and body_index was silently ignored.\n"
+        "inp.participantBodies = [body]\n"
         "ext.add(inp)\n"
         "_after = sum((b.volume if b.isValid else 0) for b in root.bRepBodies)\n"
         "_delta = _after - _before\n"
         "print('hole cut at ({xm}, {ym}) mm | volume delta: {{:+.4f}} cm^3'.format(_delta))\n"
         "if abs(_delta) < 1e-7:\n"
         "    print('WARNING: volume delta ~ZERO - the cut had NO effect (missed the body or wrong depth/location).')\n"
-    ).format(x=x, y=y, R=R, D=D, xm=x_mm, ym=y_mm)
+    ).format(x=x, y=y, R=R, D=D, xm=x_mm, ym=y_mm, bi=body_index)
     return _send(code)
 
 
@@ -765,6 +890,8 @@ def drill_hole(diameter_mm: float, x_mm: float, y_mm: float,
 def fillet_edges(radius_mm: float, body_index: int = 0, which: str = "all") -> str:
     """Round edges of a body. which='all' fillets every edge; 'vertical' only
     edges with vertical run; 'top' only edges lying on the top face plane."""
+    if which not in ("all", "vertical", "top"):
+        return "ERROR: which must be 'all', 'vertical' or 'top' (got {!r})".format(which)
     R = radius_mm / 10.0
     code = (
         "design = _require_design()\n"
@@ -784,7 +911,7 @@ def fillet_edges(radius_mm: float, body_index: int = 0, which: str = "all") -> s
         "    elif {w!r} == 'top' and on_top:\n"
         "        edges.add(e)\n"
         "if edges.count == 0:\n"
-        "    print('WARN: no edges matched which={w}')\n"
+        "    print('WARNING: no edges matched which={w} - nothing was filleted')\n"
         "else:\n"
         "    _len_mm = 0.0\n"
         "    for _e in edges:\n"
@@ -847,7 +974,7 @@ def shell_body(thickness_mm: float, body_index: int = 0, open_top: bool = True) 
         "_sliv = 0\n"
         "for f in _body2.faces:\n"
         "    try:\n"
-        "        if f.area < 0.0001:\n"
+        "        if f.area < 0.0005:   # 0.05 mm^2, as sliver_face_count()\n"
         "            _sliv += 1\n"
         "    except Exception:\n"
         "        pass\n"
@@ -860,26 +987,100 @@ def shell_body(thickness_mm: float, body_index: int = 0, open_top: bool = True) 
     return _send(code)
 
 
+# Metric coarse pitches (ISO 261), and the standard coarse tap drills. A size
+# or pitch not in the drill table uses major - pitch, the standard formula -
+# which is what makes fine pitches come out right (M8x1 -> 7.0, not 6.8).
+_METRIC_COARSE_PITCH = {
+    1.6: 0.35, 2: 0.4, 2.5: 0.45, 3: 0.5, 3.5: 0.6, 4: 0.7, 5: 0.8, 6: 1.0,
+    7: 1.0, 8: 1.25, 10: 1.5, 12: 1.75, 14: 2.0, 16: 2.0, 18: 2.5, 20: 2.5,
+    22: 2.5, 24: 3.0, 27: 3.0, 30: 3.5,
+}
+_METRIC_COARSE_DRILL = {
+    1.6: 1.25, 2: 1.6, 2.5: 2.05, 3: 2.5, 3.5: 2.9, 4: 3.3, 5: 4.2, 6: 5.0,
+    8: 6.8, 10: 8.5, 12: 10.2,
+}
+# Unified (UNC/UNF) tap drills in mm, ~75% thread (standard number/letter/
+# fractional drills). #8-32, #10-24 and #10-32 keep the metric-drill
+# substitutes earlier releases used, so existing designs do not change.
+_UNIFIED_DRILL = {
+    "#0-80": 1.19, "#1-64": 1.51, "#1-72": 1.51, "#2-56": 1.78, "#2-64": 1.78,
+    "#3-48": 1.99, "#3-56": 2.08, "#4-40": 2.26, "#4-48": 2.37, "#5-40": 2.58,
+    "#5-44": 2.64, "#6-32": 2.7, "#6-40": 2.87, "#8-32": 3.4, "#8-36": 3.45,
+    "#10-24": 3.9, "#10-32": 4.1, "#12-24": 4.5, "#12-28": 4.62,
+    "1/4-20": 5.1, "1/4-28": 5.4, "5/16-18": 6.53, "5/16-24": 6.91,
+    "3/8-16": 7.94, "3/8-24": 8.43, "7/16-14": 9.35, "7/16-20": 9.92,
+    "1/2-13": 10.72, "1/2-20": 11.51, "5/8-11": 13.49, "5/8-18": 14.68,
+    "3/4-10": 16.67, "3/4-16": 17.46,
+}
+
+
+def _tap_drill(thread_size: str):
+    """Parse a thread designation -> (drill_mm, canonical, kind, size, pitch).
+
+    Case-insensitive; accepts 'M3', 'm4', 'M4X0.7', 'M8 x 1', '#10-32',
+    '10-32', '1/4-20', '1/4-20 UNC'. For metric, `pitch` is in mm; for
+    unified it is threads per inch. Raises ValueError for anything it cannot
+    size - it never guesses. (It used to fall back to M3's 2.5 mm drill, so
+    an M20 or a lowercase 'm4' silently got a 2.5 mm hole.)"""
+    s = thread_size.strip().upper().replace(" ", "").replace('"', "")
+    for suffix in ("UNEF", "UNC", "UNF"):
+        if s.endswith(suffix):
+            s = s[:-len(suffix)]
+            break
+    m = re.fullmatch(r"M(\d+(?:\.\d+)?)(?:[X\u00d7](\d+(?:\.\d+)?))?", s)
+    if m:
+        d = float(m.group(1))
+        coarse = _METRIC_COARSE_PITCH.get(d)
+        p = float(m.group(2)) if m.group(2) else coarse
+        if p is None:
+            raise ValueError("M{:g} has no standard coarse pitch in the table - "
+                             "give the pitch, e.g. 'M{:g}x1.5'".format(d, d))
+        if not 0 < p < d / 2:
+            raise ValueError("pitch {:g} mm is implausible for M{:g}".format(p, d))
+        if coarse is not None and abs(p - coarse) < 1e-9 and d in _METRIC_COARSE_DRILL:
+            drill = _METRIC_COARSE_DRILL[d]
+        else:
+            drill = round(d - p, 3)
+        return drill, "M{:g}x{:g}".format(d, p), "metric", d, p
+    m = re.fullmatch(r"(#?\d+|\d+/\d+)-(\d+)", s)
+    if m:
+        size = m.group(1)
+        if "/" not in size and not size.startswith("#"):
+            size = "#" + size
+        key = "{}-{}".format(size, m.group(2))
+        if key in _UNIFIED_DRILL:
+            return _UNIFIED_DRILL[key], key, "unified", size, int(m.group(2))
+        raise ValueError("unified size {} is not in the tap-drill table".format(key))
+    raise ValueError("unrecognised thread size {!r}".format(thread_size))
+
+
 @mcp.tool()
 def tapped_hole(thread_size: str, x_mm: float, y_mm: float, depth_mm: float,
-                body_index: int = 0, tap_drill_only: bool = True) -> str:
-    """Create a tapped hole on the top (XY) plane, cutting downward.
+                body_index: int = 0, tap_drill_only: bool = True,
+                tap_drill_mm: float = None) -> str:
+    """Create a tapped hole on the top (XY) plane, cutting downward, into body
+    `body_index` only.
 
-    thread_size: standard designation, e.g. 'M3', 'M3x0.5', 'M4', 'M5', 'M6',
-    '1/4-20', '10-32'. tap_drill_only=True (default) cuts only the correctly
-    sized tap-drill clearance hole for you to thread with a real tap (best for
-    3D-printed and hand-tapped parts). Set False to also apply a MODELED thread
-    (visualization / CNC); modeled threads are best-effort and may be skipped
-    with a warning if Fusion can't match the designation.
+    thread_size: e.g. 'M3', 'M4x0.7', 'M8x1' (fine pitch), '#6-32', '10-32',
+    '1/4-20' - case-insensitive. Metric drills are major minus pitch, so any
+    pitch works; unified sizes come from a table. An unrecognised size is an
+    ERROR and nothing is cut - never a guess. Pass tap_drill_mm to size the
+    hole yourself. tap_drill_only=True (default) cuts only the tap-drill hole,
+    for threading with a real tap (best for 3D-printed and hand-tapped parts).
+    False also applies a MODELED thread (visualization / CNC), and prints a
+    WARNING, with the reason, if Fusion has no matching designation.
     """
-    tap_drills_mm = {
-        "M1.6": 1.25, "M2": 1.6, "M2.5": 2.05, "M3": 2.5, "M3.5": 2.9,
-        "M4": 3.3, "M5": 4.2, "M6": 5.0, "M8": 6.8, "M10": 8.5, "M12": 10.2,
-        "#4-40": 2.26, "#6-32": 2.7, "#8-32": 3.4, "#10-24": 3.9, "#10-32": 4.1,
-        "10-24": 3.9, "10-32": 4.1, "1/4-20": 5.1, "1/4-28": 5.4,
-    }
-    key = thread_size.split("x")[0].strip()
-    drill_mm = tap_drills_mm.get(key, tap_drills_mm.get(thread_size, 2.5))
+    try:
+        drill_mm, canon, kind, size, pitch = _tap_drill(thread_size)
+    except ValueError as e:
+        if tap_drill_mm is None:
+            return ("ERROR: {}. Nothing was cut. Supported: metric 'M<d>' or "
+                    "'M<d>x<pitch>' (any pitch), and unified: {}. Or pass "
+                    "tap_drill_mm to size the hole yourself."
+                    .format(e, ", ".join(sorted(_UNIFIED_DRILL))))
+        drill_mm, canon, kind, size, pitch = None, thread_size, None, None, None
+    if tap_drill_mm is not None:
+        drill_mm = float(tap_drill_mm)
     drill = drill_mm / 20.0  # radius in cm
     D = depth_mm / 10.0
     x, y = x_mm / 10.0, y_mm / 10.0
@@ -896,46 +1097,91 @@ def tapped_hole(thread_size: str, x_mm: float, y_mm: float, depth_mm: float,
         "ext = root.features.extrudeFeatures\n"
         "inp = ext.createInput(prof, adsk.fusion.FeatureOperations.CutFeatureOperation)\n"
         "inp.setDistanceExtent(False, adsk.core.ValueInput.createByReal(-{D}))\n"
+        "inp.participantBodies = [body]   # only the chosen body\n"
         "hole = ext.add(inp)\n"
         "_after = sum((b.volume if b.isValid else 0) for b in root.bRepBodies)\n"
         "_delta = _after - _before\n"
-        "print('tap-drill hole (' + str(_ts) + ', dia {dmm}mm) cut at ({xm},{ym})mm | volume delta: ' + '{{:+.4f}}'.format(_delta) + ' cm^3')\n"
+        "print('tap-drill hole (' + _ts + ', dia {dmm}mm) cut at ({xm},{ym})mm | volume delta: ' + '{{:+.4f}}'.format(_delta) + ' cm^3')\n"
         "if abs(_delta) < 1e-7:\n"
         "    print('WARNING: volume delta ~ZERO - tap-drill cut had NO effect (missed body / wrong location / depth).')\n"
         "if not {tdo}:\n"
+        "    KIND = {kind!r}\n"
+        "    MAJOR = {size!r}\n"
+        "    PITCH = {pitch!r}\n"
+        "    _applied = None\n"
+        "    _why = 'unknown'\n"
         "    try:\n"
+        "        import re as _re\n"
         "        threads = root.features.threadFeatures\n"
         "        q = threads.threadDataQuery\n"
-        "        tclass = q.defaultMetricThreadType\n"
-        "        ok, sizes = q.getAllSizes(tclass)\n"
+        "        tclass = None\n"
+        "        if KIND == 'metric':\n"
+        "            tclass = q.defaultMetricThreadType\n"
+        "        elif KIND == 'unified':\n"
+        "            tclass = q.defaultInchThreadType\n"
+        "        else:\n"
+        "            _why = 'designation %r cannot be matched to a Fusion thread' % _ts\n"
         "        size = None\n"
-        "        for s in (sizes or []):\n"
-        "            if s.replace(' ', '') == '{szkey}'.replace('M',''):\n"
-        "                size = s\n"
-        "                break\n"
-        "        if size is None and sizes:\n"
-        "            size = sizes[0]\n"
-        "        ok2, desigs = q.getAllDesignations(tclass, size)\n"
-        "        desig = desigs[0] if (ok2 and desigs) else None\n"
+        "        if tclass:\n"
+        "            ok, sizes = q.getAllSizes(tclass)\n"
+        "            for s in (sizes or []):\n"
+        "                ss = s.replace(' ', '').upper()\n"
+        "                if KIND == 'metric':\n"
+        "                    try:\n"
+        "                        if abs(float(ss) - MAJOR) < 1e-6:\n"
+        "                            size = s\n"
+        "                            break\n"
+        "                    except ValueError:\n"
+        "                        pass\n"
+        "                elif ss == MAJOR:\n"
+        "                    size = s\n"
+        "                    break\n"
+        "            if size is None:\n"
+        "                _why = 'thread type %r has no size %r' % (tclass, MAJOR)\n"
+        "        desig = None\n"
+        "        if size is not None:\n"
+        "            ok2, desigs = q.getAllDesignations(tclass, size)\n"
+        "            for dsg in (desigs or []):\n"
+        "                du = dsg.replace(' ', '').upper()\n"
+        "                if KIND == 'metric':\n"
+        "                    _m = _re.match(r'M([\\d.]+)X([\\d.]+)', du)\n"
+        "                    if _m and abs(float(_m.group(2)) - PITCH) < 1e-6:\n"
+        "                        desig = dsg\n"
+        "                        break\n"
+        "                else:\n"
+        "                    want = '%s-%d' % (MAJOR, PITCH)\n"
+        "                    if du.startswith(want) and not du[len(want):len(want) + 1].isdigit():\n"
+        "                        desig = dsg\n"
+        "                        break\n"
+        "            if desig is None:\n"
+        "                _why = 'no %s designation among the %d Fusion offers for size %r' % (_ts, len(desigs or []), size)\n"
         "        side = None\n"
         "        for f in hole.sideFaces:\n"
         "            side = f\n"
         "            break\n"
-        "        if side and desig:\n"
-        "            tinfo = threads.createThreadInfo(True, tclass, size, desig)\n"
+        "        if desig and side is None:\n"
+        "            _why = 'the cut produced no side face to thread'\n"
+        "        if desig and side is not None:\n"
+        "            ok3, classes = q.getAllClasses(True, tclass, desig)\n"
+        "            cls = classes[0] if (ok3 and classes) else ''\n"
+        "            # createThreadInfo(isInternal, threadType, designation, class)\n"
+        "            tinfo = threads.createThreadInfo(True, tclass, desig, cls)\n"
         "            fc = adsk.core.ObjectCollection.create()\n"
         "            fc.add(side)\n"
         "            tin = threads.createInput(fc, tinfo)\n"
         "            tin.isModeled = True\n"
         "            threads.add(tin)\n"
-        "            print('modeled thread applied: ' + str(desig))\n"
-        "        else:\n"
-        "            print('WARN: modeled thread skipped (no face/designation match)')\n"
+        "            _applied = '%s %s' % (desig, cls)\n"
         "    except Exception as _te:\n"
-        "        print('WARN: modeled thread skipped: ' + str(_te))\n"
-    ).format(bi=body_index, x=x, y=y, R=drill, D=D, ts=thread_size,
-             dmm=drill_mm, xm=x_mm, ym=y_mm, tdo=tap_drill_only,
-             szkey=key.replace('M', ''))
+        "        _why = str(_te)[:120]\n"
+        "    if _applied:\n"
+        "        print('modeled thread applied: ' + _applied)\n"
+        "    else:\n"
+        "        print('WARNING: modeled thread NOT applied (%s). The tap-drill hole '\n"
+        "              'above was cut.' % _why)\n"
+    ).format(bi=body_index, x=x, y=y, R=drill, D=D, ts=canon, dmm=drill_mm,
+             xm=x_mm, ym=y_mm, tdo=tap_drill_only, kind=kind, size=size,
+             pitch=pitch)
     return _send(code)
 
 
@@ -953,13 +1199,8 @@ def sketch_on_face(component_name: str = "", which: str = "top",
     code = (
         "design = _require_design()\n"
         "root = design.rootComponent\n"
-        "host = root\n"
         "cn = {cn!r}\n"
-        "if cn:\n"
-        "    for occ in root.allOccurrences:\n"
-        "        if occ.component.name == cn:\n"
-        "            host = occ.component\n"
-        "            break\n"
+        "host = find_component(cn)   # raises on a miss; never falls back to root\n"
         "body = host.bRepBodies.item({bi})\n"
         "sel = {{'top':('z','max'),'bottom':('z','min'),'front':('y','min'),"
         "'back':('y','max'),'right':('x','max'),'left':('x','min')}}[{w!r}]\n"
@@ -1003,6 +1244,7 @@ def hole_on_face(diameter_mm: float, u_mm: float, v_mm: float,
         "    prof = sk.profiles.item(0)\n"
         "    ext = comp.features.extrudeFeatures\n"
         "    inp = ext.createInput(prof, adsk.fusion.FeatureOperations.CutFeatureOperation)\n"
+        "    inp.participantBodies = [face.body]   # only the body that owns the face\n"
         "    if {thru}:\n"
         "        ext_dir = adsk.fusion.ExtentDirections.NegativeExtentDirection\n"
         "        inp.setAllExtent(ext_dir)\n"
@@ -1045,8 +1287,10 @@ def get_model_state() -> str:
         "            lineage = '(none)'\n"
         "            saved = 'UNSAVED'\n"
         "    except Exception:\n"
-        "        lineage = '(none)'\n"
-        "        saved = 'UNSAVED'\n"
+        "        # app.data unavailable: the lineage CANNOT be read. Saying\n"
+        "        # UNSAVED here is what leads to saveAs -> a duplicate design.\n"
+        "        lineage = 'UNKNOWN (app.data unavailable)'\n"
+        "        saved = 'UNKNOWN - run document_report() before saving'\n"
         "    lines.append('ACTIVE DOCUMENT: ' + dname + '  [' + saved + ']  lineage=' + str(lineage))\n"
         "except Exception:\n"
         "    lines.append('ACTIVE DOCUMENT: (could not read)')\n"
@@ -1065,7 +1309,7 @@ def get_model_state() -> str:
         "    _scan = b.faces if _fcount <= 4000 else []\n"
         "    for f in _scan:\n"
         "        try:\n"
-        "            if f.area < 0.0001:\n"
+        "            if f.area < 0.0005:   # 0.05 mm^2, as sliver_face_count()\n"
         "                slivers += 1\n"
         "        except Exception:\n"
         "            pass\n"
@@ -1286,7 +1530,6 @@ def list_edges(body_index: int = 0, max_edges: int = 40) -> str:
         "print('\\n'.join(lines))\n"
     ) % (body_index, max_edges)
     return _send(code, compact=False)
-    return _send(code)
 
 
 @mcp.tool()
@@ -1298,7 +1541,10 @@ def heartbeat() -> str:
     restart the MCPListener add-in. (ping_fusion returns the same liveness data;
     this adds the recovery instructions.)"""
     try:
-        r = requests.get(LISTENER_URL + "/ping", timeout=5)
+        r = requests.get(LISTENER_URL + "/ping", headers=_headers(), timeout=5)
+        refused = _refused(r)
+        if refused:
+            return refused
         d = r.json()
         pm = _check_protocol(d)
         if pm:
@@ -1337,12 +1583,10 @@ def view_model(orientation: str = "iso",
     Raise it only when judging a fine detail; drop to 640x480 (~410) for a
     quick sanity look.
     """
-    tmp = os.path.join(os.path.expanduser("~"), "fusion_view.png")
-    try:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-    except Exception:
-        pass
+    # A fresh temp file per call. The old fixed ~/fusion_view.png was shared
+    # by concurrent calls and left behind in the home folder.
+    fd, tmp = tempfile.mkstemp(prefix="fusion_view_", suffix=".png")
+    os.close(fd)
     zoom = None
     if None not in (zoom_x_mm, zoom_y_mm, zoom_z_mm) and zoom_radius_mm:
         zoom = (zoom_x_mm / 10.0, zoom_y_mm / 10.0, zoom_z_mm / 10.0,
@@ -1384,13 +1628,19 @@ def view_model(orientation: str = "iso",
         "    print('screenshot ok' if res else 'screenshot FAILED')\n"
     ).format(o=orientation, z=zoom, path=tmp,
              w=max(320, int(width)), h=max(240, int(height)))
-    result = _send(code)
-    if "unknown orientation" in result:
-        raise RuntimeError(result)
-    if "screenshot ok" not in result or not os.path.exists(tmp):
-        raise RuntimeError("view_model failed: " + result)
-    with open(tmp, "rb") as f:
-        data = f.read()
+    try:
+        result = _send(code)
+        if "unknown orientation" in result:
+            raise RuntimeError(result)
+        if "screenshot ok" not in result or os.path.getsize(tmp) == 0:
+            raise RuntimeError("view_model failed: " + result)
+        with open(tmp, "rb") as f:
+            data = f.read()
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
     return Image(data=data, format="png")
 
 
@@ -1456,20 +1706,17 @@ def box_in_component(component_name: str, length_mm: float, width_mm: float,
                      height_mm: float, ox_mm: float = 0, oy_mm: float = 0,
                      oz_mm: float = 0) -> str:
     """Create a box INSIDE a named component (on its own XY plane at the given
-    local origin). This is how an assembly part gets its geometry."""
+    local origin). This is how an assembly part gets its geometry.
+    component_name: the component, or any occurrence of it ('Screw:3')."""
+    if not component_name:
+        return "ERROR: component_name is required (use create_box for the root component)"
     L, W, H = length_mm / 10.0, width_mm / 10.0, height_mm / 10.0
     ox, oy, oz = ox_mm / 10.0, oy_mm / 10.0, oz_mm / 10.0
     code = (
         "design = _require_design()\n"
         "root = design.rootComponent\n"
-        "comp = None\n"
-        "for occ in root.allOccurrences:\n"
-        "    if occ.component.name == {cn!r}:\n"
-        "        comp = occ.component\n"
-        "        break\n"
-        "if comp is None:\n"
-        "    print('ERROR: no component named ' + str({cn!r}))\n"
-        "else:\n"
+        "comp = find_component({cn!r})   # raises, listing what exists\n"
+        "if comp is not None:\n"
         "    sk = comp.sketches.add(comp.xYConstructionPlane)\n"
         "    p0 = adsk.core.Point3D.create({ox}, {oy}, {oz})\n"
         "    p1 = adsk.core.Point3D.create({x1}, {y1}, {oz})\n"
@@ -1485,21 +1732,22 @@ def box_in_component(component_name: str, length_mm: float, width_mm: float,
 
 @mcp.tool()
 def move_component(component_name: str, x_mm: float, y_mm: float, z_mm: float) -> str:
-    """Set an occurrence's position (origin translated to x,y,z in mm). Position
-    parts BEFORE jointing; joints override transforms afterward."""
+    """Set an occurrence's position (origin translated to x,y,z in mm), keeping
+    its rotation. component_name: an occurrence name ('Screw:3') to pick one
+    copy, or a component name used by exactly one occurrence - an ambiguous
+    name is an ERROR listing the occurrence names. Position parts BEFORE
+    jointing; joints override transforms afterward."""
     x, y, z = x_mm / 10.0, y_mm / 10.0, z_mm / 10.0
     code = (
         "design = _require_design()\n"
         "root = design.rootComponent\n"
-        "target = None\n"
-        "for occ in root.allOccurrences:\n"
-        "    if occ.component.name == {cn!r}:\n"
-        "        target = occ\n"
-        "        break\n"
-        "if target is None:\n"
-        "    print('ERROR: no component named ' + str({cn!r}))\n"
-        "else:\n"
-        "    m = adsk.core.Matrix3D.create()\n"
+        "# an occurrence name ('Screw:3') picks one copy; a bare component\n"
+        "# name is accepted only if exactly one occurrence uses it\n"
+        "target = find_occurrence({cn!r})\n"
+        "if target is not None:\n"
+        "    # Change ONLY the translation. Building a fresh identity matrix\n"
+        "    # silently dropped any rotation the occurrence had.\n"
+        "    m = target.transform\n"
         "    m.translation = adsk.core.Vector3D.create({x}, {y}, {z})\n"
         "    target.transform = m\n"
         "    try:\n"
@@ -1516,24 +1764,23 @@ def move_component(component_name: str, x_mm: float, y_mm: float, z_mm: float) -
 def copy_component(component_name: str, count: int, dx_mm: float = 0,
                    dy_mm: float = 0, dz_mm: float = 0) -> str:
     """Place `count` additional occurrences of an existing component in a linear
-    pattern, each offset (dx,dy,dz) mm from the previous. Reuses one definition
-    (edit once, all update) - ideal for repeated hardware."""
+    pattern, each offset (dx,dy,dz) mm from the previous, with the source's
+    rotation. Reuses one definition (edit once, all update) - ideal for
+    repeated hardware. The copies are occurrences named like 'Screw:2',
+    'Screw:3' (see list_components); pass those names to move_component,
+    ground_component and the joint tools to address one copy. Once copied, the
+    bare component name is ambiguous there, so pass an occurrence name here
+    too if you copy again."""
     dx, dy, dz = dx_mm / 10.0, dy_mm / 10.0, dz_mm / 10.0
     code = (
         "design = _require_design()\n"
         "root = design.rootComponent\n"
-        "src = None\n"
-        "for occ in root.allOccurrences:\n"
-        "    if occ.component.name == {cn!r}:\n"
-        "        src = occ\n"
-        "        break\n"
-        "if src is None:\n"
-        "    print('ERROR: no component named ' + str({cn!r}))\n"
-        "else:\n"
+        "src = find_occurrence({cn!r})   # the copy to pattern from\n"
+        "if src is not None:\n"
         "    base = src.transform.translation\n"
         "    made = 0\n"
         "    for i in range(1, {cnt}+1):\n"
-        "        m = adsk.core.Matrix3D.create()\n"
+        "        m = src.transform   # copies keep the source's rotation\n"
         "        m.translation = adsk.core.Vector3D.create(base.x+{dx}*i, base.y+{dy}*i, base.z+{dz}*i)\n"
         "        root.occurrences.addExistingComponent(src.component, m)\n"
         "        made += 1\n"
@@ -1544,19 +1791,17 @@ def copy_component(component_name: str, count: int, dx_mm: float = 0,
 
 @mcp.tool()
 def ground_component(component_name: str, grounded: bool = True) -> str:
-    """Ground (lock in space) or unground a component. An assembly needs exactly
-    one grounded base so other parts joint relative to it. Ground base first."""
+    """Ground (lock in space) or unground an occurrence. An assembly needs
+    exactly one grounded base so other parts joint relative to it. Ground base
+    first. Accepts an occurrence name ('Base:1') or an unambiguous component
+    name."""
     code = (
         "design = _require_design()\n"
         "root = design.rootComponent\n"
-        "target = None\n"
-        "for occ in root.allOccurrences:\n"
-        "    if occ.component.name == {cn!r}:\n"
-        "        target = occ\n"
-        "        break\n"
-        "if target is None:\n"
-        "    print('ERROR: no component named ' + str({cn!r}))\n"
-        "else:\n"
+        "# an occurrence name ('Screw:3') picks one copy; a bare component\n"
+        "# name is accepted only if exactly one occurrence uses it\n"
+        "target = find_occurrence({cn!r})\n"
+        "if target is not None:\n"
         "    target.isGrounded = {g}\n"
         "    print(str({cn!r}) + ' grounded={g}')\n"
     ).format(cn=component_name, g=grounded)
@@ -1566,6 +1811,21 @@ def ground_component(component_name: str, grounded: bool = True) -> str:
 # ==========================================================================
 # JOINTS
 # ==========================================================================
+_JOINT_AXES = {"x": "XAxisJointDirection", "y": "YAxisJointDirection",
+               "z": "ZAxisJointDirection"}
+
+
+def _joint_args_error(motion: str, axis: str) -> str:
+    """'' if valid. Unknown values used to be replaced silently - 'slider'
+    built a RIGID joint and still printed 'CONFIRMED: slider joint created'."""
+    if motion not in ("rigid", "revolute"):
+        return ("ERROR: motion must be 'rigid' or 'revolute' (got {!r}). Other "
+                "joint types need run_fusion_code.".format(motion))
+    if axis not in _JOINT_AXES:
+        return "ERROR: axis must be 'x', 'y' or 'z' (got {!r})".format(axis)
+    return ""
+
+
 @mcp.tool()
 def rigid_joint(component_a: str, component_b: str) -> str:
     """Create a RIGID joint locking two components together at their current
@@ -1579,6 +1839,9 @@ def rigid_joint(component_a: str, component_b: str) -> str:
 def revolute_joint(component_a: str, component_b: str, axis: str = "z") -> str:
     """Create a REVOLUTE joint (one rotational DOF) about axis (x/y/z) at the
     components' origins. For hinges, lids, swinging arms."""
+    err = _joint_args_error("revolute", axis)
+    if err:
+        return err
     code = _joint_code(component_a, component_b, "revolute", axis,
                        use_origin=True, ax=0, ay=0, az=0, bx=0, by=0, bz=0)
     return _send(code)
@@ -1591,6 +1854,9 @@ def joint_at_point(component_a: str, ax_mm: float, ay_mm: float, az_mm: float,
     """Joint two components at explicit LOCAL points (each component's own
     coordinate space, mm) rather than their origins. Creates a construction
     point on each, then joins. motion: 'rigid' or 'revolute'; axis for revolute."""
+    err = _joint_args_error(motion, axis)
+    if err:
+        return err
     code = _joint_code(component_a, component_b, motion, axis, use_origin=False,
                        ax=ax_mm / 10.0, ay=ay_mm / 10.0, az=az_mm / 10.0,
                        bx=bx_mm / 10.0, by=by_mm / 10.0, bz=bz_mm / 10.0)
@@ -1618,9 +1884,7 @@ def list_joints() -> str:
 
 def _joint_code(ca, cb, motion, axis, use_origin, ax, ay, az, bx, by, bz):
     """Shared joint builder. Not a tool (no decorator) - internal helper."""
-    amap = {"x": "XAxisJointDirection", "y": "YAxisJointDirection",
-            "z": "ZAxisJointDirection"}
-    axdir = amap.get(axis, "ZAxisJointDirection")
+    axdir = _JOINT_AXES[axis]   # validated by the calling tool
     if use_origin:
         geo_setup = (
             "    ga = adsk.fusion.JointGeometry.createByPoint(\n"
@@ -1649,16 +1913,11 @@ def _joint_code(ca, cb, motion, axis, use_origin, ax, ay, az, bx, by, bz):
     return (
         "design = _require_design()\n"
         "root = design.rootComponent\n"
-        "def find(name):\n"
-        "    for occ in root.allOccurrences:\n"
-        "        if occ.component.name == name:\n"
-        "            return occ\n"
-        "    return None\n"
-        "a = find({ca!r})\n"
-        "b = find({cb!r})\n"
-        "if not a or not b:\n"
-        "    print('ERROR: component not found (a=' + str({ca!r}) + ' b=' + str({cb!r}) + ')')\n"
-        "else:\n"
+        "# occurrence names ('Screw:3') or unambiguous component names; a miss\n"
+        "# or an ambiguous name raises with the list of valid names\n"
+        "a = find_occurrence({ca!r})\n"
+        "b = find_occurrence({cb!r})\n"
+        "if a is not None and b is not None:\n"
         + geo_setup +
         "    _jbefore = root.joints.count\n"
         "    ji = root.joints.createInput(ga, gb)\n"
@@ -1678,60 +1937,78 @@ def _joint_code(ca, cb, motion, axis, use_origin, ax, ay, az, bx, by, bz):
 # ==========================================================================
 # EXPORT
 # ==========================================================================
+def _export_verify(kind: str, indent: int = 0) -> str:
+    """Generated-code tail shared by the export tools; expects _os, _p, _m0 and
+    _ok to be set. CONFIRMED needs the call to succeed AND the file to have
+    been written by THIS call: a file left at the same path by an earlier
+    export used to pass the size check even when this export failed."""
+    lines = [
+        "_sz = _os.path.getsize(_p) if _os.path.exists(_p) else -1",
+        "_m1 = _os.stat(_p).st_mtime_ns if _os.path.exists(_p) else None",
+        "_fresh = _m1 is not None and _m1 != _m0",
+        "if _ok and _sz > 0 and _fresh:",
+        "    print('CONFIRMED: exported " + kind + " to %s (%d bytes)' % (_p, _sz))",
+        "else:",
+        "    if _m0 is not None and not _fresh:",
+        "        _state = 'NOT rewritten - what is there is from an earlier export'",
+        "    elif _sz >= 0:",
+        "        _state = '%d bytes' % _sz",
+        "    else:",
+        "        _state = 'does not exist'",
+        "    print('*** EXPORT FAILED: the call returned %s; file %s. Do NOT report '",
+        "          'this as exported. Check the folder exists and is writable. ***'",
+        "          % (_ok, _state))",
+    ]
+    pad = " " * indent
+    return "".join(pad + ln + "\n" for ln in lines)
+
+
+_EXPORT_HEAD = (
+    "import os as _os\n"
+    "_p = {fp!r}\n"
+    "_m0 = _os.stat(_p).st_mtime_ns if _os.path.exists(_p) else None\n"
+)
+
+
 @mcp.tool()
 def export_step(filepath: str) -> str:
-    """Export the active design to a STEP file at an absolute path (.step)."""
-    code = (
+    """Export the active design to a STEP file at an absolute path (.step).
+    CONFIRMED only if the export succeeded AND wrote the file."""
+    code = (_EXPORT_HEAD + (
         "design = _require_design()\n"
         "em = design.exportManager\n"
-        "opts = em.createSTEPExportOptions({fp!r})\n"
+        "opts = em.createSTEPExportOptions(_p)\n"
         "_ok = em.execute(opts)\n"
-        "import os as _os\n"
-        "_p = {fp!r}\n"
-        "_sz = _os.path.getsize(_p) if _os.path.exists(_p) else -1\n"
-        "if _ok and _sz > 0:\n"
-        "    print('CONFIRMED: exported STEP to %s (%d bytes)' % (_p, _sz))\n"
-        "else:\n"
-        "    print('*** EXPORT FAILED: execute()=%s, file %s. Nothing usable '\n"
-        "          'was written - do NOT report this as exported. Check the '\n"
-        "          'folder exists and is writable. ***'\n"
-        "          % (_ok, ('%d bytes' % _sz) if _sz >= 0 else 'does not exist'))\n"
-    ).format(fp=filepath)
+    )).format(fp=filepath) + _export_verify("STEP")
     return _send(code)
 
 
 @mcp.tool()
 def export_stl(filepath: str, body_index: int = 0, quality: str = "medium") -> str:
-    """Export a body to STL for 3D printing. quality: low/medium/high."""
+    """Export a body to STL for 3D printing. quality: low/medium/high.
+    CONFIRMED only if the export succeeded AND wrote the file."""
     # Actual members on this build are MeshRefinementLow/Medium/High/Custom.
     # The *QualityTriangleMeshRefinement names do NOT exist and raise
     # AttributeError at every quality setting.
     qmap = {"low": "MeshRefinementLow",
             "medium": "MeshRefinementMedium",
             "high": "MeshRefinementHigh"}
-    ref = qmap.get(quality, qmap["medium"])
-    code = (
+    if quality not in qmap:
+        return "ERROR: quality must be 'low', 'medium' or 'high' (got {!r})".format(quality)
+    ref = qmap[quality]
+    code = (_EXPORT_HEAD + (
         "design = _require_design()\n"
         "root = design.rootComponent\n"
         "body = root.bRepBodies.item({bi})\n"
         "em = design.exportManager\n"
-        "opts = em.createSTLExportOptions(body, {fp!r})\n"
+        "opts = em.createSTLExportOptions(body, _p)\n"
         "try:\n"
         "    opts.meshRefinement = getattr(adsk.fusion.MeshRefinementSettings, {ref!r})\n"
         "except AttributeError:\n"
         "    _avail = [a for a in dir(adsk.fusion.MeshRefinementSettings) if 'Refinement' in a]\n"
         "    print('WARN: {ref} missing; available: ' + str(_avail))\n"
         "_ok = em.execute(opts)\n"
-        "import os as _os\n"
-        "_p = {fp!r}\n"
-        "_sz = _os.path.getsize(_p) if _os.path.exists(_p) else -1\n"
-        "if _ok and _sz > 0:\n"
-        "    print('CONFIRMED: exported STL to %s (%d bytes)' % (_p, _sz))\n"
-        "else:\n"
-        "    print('*** EXPORT FAILED: execute()=%s, file %s. Nothing usable '\n"
-        "          'was written - do NOT report this as exported. ***'\n"
-        "          % (_ok, ('%d bytes' % _sz) if _sz >= 0 else 'does not exist'))\n"
-    ).format(bi=body_index, fp=filepath, ref=ref)
+    )).format(bi=body_index, fp=filepath, ref=ref) + _export_verify("STL")
     return _send(code)
 
 
@@ -1739,31 +2016,16 @@ def export_stl(filepath: str, body_index: int = 0, quality: str = "medium") -> s
 def export_dxf(filepath: str, sketch_index: int = 0,
                component_name: str = "") -> str:
     """Export a sketch's profile to DXF (flat-stock / laser / waterjet). Selects
-    sketch by index within the root (or a named component). filepath absolute (.dxf)."""
-    code = (
+    sketch by index within the root (or a named component). filepath absolute
+    (.dxf). CONFIRMED only if saveAsDXF succeeded AND wrote the file."""
+    code = (_EXPORT_HEAD + (
         "design = _require_design()\n"
-        "root = design.rootComponent\n"
-        "host = root\n"
-        "cn = {cn!r}\n"
-        "if cn:\n"
-        "    for occ in root.allOccurrences:\n"
-        "        if occ.component.name == cn:\n"
-        "            host = occ.component\n"
-        "            break\n"
+        "host = find_component({cn!r})   # raises on a miss; never falls back to root\n"
         "if host.sketches.count == 0:\n"
-        "    print('ERROR: no sketches to export')\n"
-        "else:\n"
-        "    sk = host.sketches.item({si})\n"
-        "    sk.saveAsDXF({fp!r})\n"
-        "    import os as _os\n"
-        "    _p = {fp!r}\n"
-        "    _sz = _os.path.getsize(_p) if _os.path.exists(_p) else -1\n"
-        "    if _sz > 0:\n"
-        "        print('CONFIRMED: exported DXF to %s (%d bytes)' % (_p, _sz))\n"
-        "    else:\n"
-        "        print('*** DXF EXPORT FAILED: file %s. Do NOT report this as '\n"
-        "              'exported. ***' % (('%d bytes' % _sz) if _sz >= 0 else 'missing'))\n"
-    ).format(cn=component_name, si=sketch_index, fp=filepath)
+        "    raise RuntimeError('no sketches to export in component ' + host.name)\n"
+        "sk = host.sketches.item({si})\n"
+        "_ok = sk.saveAsDXF(_p)   # this return value used to be ignored\n"
+    )).format(cn=component_name, si=sketch_index, fp=filepath) + _export_verify("DXF")
     return _send(code)
 
 
@@ -2008,12 +2270,7 @@ def wrap_cut(sketch_index: int = -1, depth_mm: float = 1.0,
         "design = _require_design()\n"
         "root = design.rootComponent\n"
         "cn = {cn!r}\n"
-        "host = root\n"
-        "if cn:\n"
-        "    for occ in root.allOccurrences:\n"
-        "        if occ.component.name == cn:\n"
-        "            host = occ.component\n"
-        "            break\n"
+        "host = find_component(cn)   # raises on a miss; never falls back to root\n"
         "if host.sketches.count == 0:\n"
         "    print('ERROR: no sketches to wrap')\n"
         "else:\n"
@@ -2097,12 +2354,7 @@ def project_to_surface(sketch_index: int = -1, face_tempid: int = 0,
         "design = _require_design()\n"
         "root = design.rootComponent\n"
         "cn = {cn!r}\n"
-        "host = root\n"
-        "if cn:\n"
-        "    for occ in root.allOccurrences:\n"
-        "        if occ.component.name == cn:\n"
-        "            host = occ.component\n"
-        "            break\n"
+        "host = find_component(cn)   # raises on a miss; never falls back to root\n"
         "sk = host.sketches.item(host.sketches.count - 1 if {si} < 0 else {si})\n"
         "tid = {tid}\n"
         "face = None\n"
@@ -2147,21 +2399,19 @@ def construction_plane_offset(offset_mm: float, base: str = "xy",
     'Environment is not supported' on this build. Echoes the plane's world
     position so a unit slip is visible immediately (setByOffset takes INTERNAL
     cm - passing mm puts the plane 10x too far and embosses silently no-op)."""
+    if base.lower() not in ("xy", "xz", "yz"):
+        # used to fall back to XY silently while reporting the requested base
+        return "ERROR: base must be 'xy', 'xz' or 'yz' (got {!r})".format(base)
     code = (
         "design = _require_design()\n"
         "root = design.rootComponent\n"
         "cn = {cn!r}\n"
-        "host = root\n"
-        "if cn:\n"
-        "    for occ in root.allOccurrences:\n"
-        "        if occ.component.name == cn:\n"
-        "            host = occ.component\n"
-        "            break\n"
+        "host = find_component(cn)   # raises on a miss; never falls back to root\n"
         "base = {b!r}.lower()\n"
         "planes = {{'xy': host.xYConstructionPlane,\n"
         "          'xz': host.xZConstructionPlane,\n"
         "          'yz': host.yZConstructionPlane}}\n"
-        "bp = planes.get(base, host.xYConstructionPlane)\n"
+        "bp = planes[base]\n"
         "ci = host.constructionPlanes.createInput()\n"
         "ci.setByOffset(bp, adsk.core.ValueInput.createByReal({off}))\n"
         "pl = host.constructionPlanes.add(ci)\n"
@@ -2179,18 +2429,16 @@ def construction_plane_tangent(angle_deg: float = 0.0, body_index: int = 0,
     """Create a construction plane TANGENT to the largest cylindrical/curved
     face at a given angle around its axis. This is the reliable way to place
     sketches for multi-sector wraps (0/90/180/270 deg) on revolved bodies.
-    Echoes world position so unit/orientation slips surface immediately."""
+    Echoes world position so unit/orientation slips surface immediately.
+    The plane is built from a sketch point, so each call leaves one hidden
+    reference sketch named mcp_tangent_ref_<angle>deg - the plane depends on
+    it, so do not delete it."""
     code = (
         "import math\n"
         "design = _require_design()\n"
         "root = design.rootComponent\n"
         "cn = {cn!r}\n"
-        "host = root\n"
-        "if cn:\n"
-        "    for occ in root.allOccurrences:\n"
-        "        if occ.component.name == cn:\n"
-        "            host = occ.component\n"
-        "            break\n"
+        "host = find_component(cn)   # raises on a miss; never falls back to root\n"
         "body = host.bRepBodies.item({bi})\n"
         "best = None\n"
         "for f in body.faces:\n"
@@ -2215,12 +2463,21 @@ def construction_plane_tangent(angle_deg: float = 0.0, body_index: int = 0,
         "    py = cy + r * math.sin(th)\n"
         "    sk3 = host.sketches.add(host.xYConstructionPlane)\n"
         "    pt = sk3.sketchPoints.add(adsk.core.Point3D.create(px, py, cz))\n"
+        "    # The plane is defined BY this sketch point, so the sketch must stay\n"
+        "    # (deleting it breaks the plane). Name and hide it so it reads as a\n"
+        "    # deliberate reference rather than stray geometry.\n"
+        "    try:\n"
+        "        sk3.name = 'mcp_tangent_ref_%gdeg' % {ang}\n"
+        "        sk3.isVisible = False\n"
+        "    except Exception:\n"
+        "        pass\n"
         "    ci = host.constructionPlanes.createInput()\n"
         "    try:\n"
         "        ci.setByTangentAtPoint(best, pt)\n"
         "        pl = host.constructionPlanes.add(ci)\n"
         "        g = pl.geometry\n"
         "        print('tangent plane at %.1f deg' % {ang})\n"
+        "        print('  reference sketch: ' + sk3.name + ' (hidden; the plane depends on it)')\n"
         "        print('  world origin: (%.3f, %.3f, %.3f) mm' % (g.origin.x*10, g.origin.y*10, g.origin.z*10))\n"
         "        print('  normal: (%.3f, %.3f, %.3f)' % (g.normal.x, g.normal.y, g.normal.z))\n"
         "    except Exception as _e:\n"
@@ -2240,12 +2497,7 @@ def sketch_axis_map(sketch_index: int = -1, component_name: str = "") -> str:
         "design = _require_design()\n"
         "root = design.rootComponent\n"
         "cn = {cn!r}\n"
-        "host = root\n"
-        "if cn:\n"
-        "    for occ in root.allOccurrences:\n"
-        "        if occ.component.name == cn:\n"
-        "            host = occ.component\n"
-        "            break\n"
+        "host = find_component(cn)   # raises on a miss; never falls back to root\n"
         "if host.sketches.count == 0:\n"
         "    print('ERROR: no sketches')\n"
         "else:\n"
@@ -2308,12 +2560,7 @@ def cut_prisms(prisms: str, body_index: int = 0, component_name: str = "") -> st
         "design = _require_design()\n"
         "root = design.rootComponent\n"
         "cn = {cn!r}\n"
-        "host = root\n"
-        "if cn:\n"
-        "    for occ in root.allOccurrences:\n"
-        "        if occ.component.name == cn:\n"
-        "            host = occ.component\n"
-        "            break\n"
+        "host = find_component(cn)   # raises on a miss; never falls back to root\n"
         "body = host.bRepBodies.item({bi})\n"
         "_before = body.volume if body.isValid else 0\n"
         "CUTTERS = {cut!r}\n"
@@ -2422,7 +2669,7 @@ _ASM_HINTS = {
     "ASM_SELF_INTER":
         "the result would self-intersect. For a SWEEP this is usually the PATH, "
         "not the profile: the path's minimum curvature radius is smaller than "
-        "the tube radius. Check with sweep_tube(), which reports curvature.",
+        "the tube radius. Check with sweep_tube_check(), which reports curvature.",
     "FILLET_NO_EDGE_FOUND":
         "the edge selection resolved to nothing - typically stale tempIds after "
         "an operation split faces. Re-query with list_edges / select_edges.",
@@ -2453,7 +2700,7 @@ def explain_fillet_error(message: str) -> str:
 @mcp.tool()
 def fillet_edges_smart(radius_mm: float, body_index: int = 0,
                        which: str = "all", min_radius_mm: float = 0.2,
-                       edge_tempids: str = "") -> str:
+                       edge_tempids: str = "", component_name: str = "") -> str:
     """Fillet that searches for a working configuration AND verifies the result.
 
     Pass `edge_tempids` (from select_edges/list_edges) for real selection;
@@ -2462,19 +2709,25 @@ def fillet_edges_smart(radius_mm: float, body_index: int = 0,
     ~0.1*r^2*L) AND topology (faces consumed smaller than 4r^2 - an over-large
     radius eats narrow features while volume still looks fine). Overshoots roll
     back. Zero delta at every radius = the surfaces already meet tangentially
-    and need no fillet, reported as a result not a failure."""
+    and need no fillet, reported as a result not a failure.
+
+    component_name: the component that owns the body (empty = root) - pass
+    the same one you gave select_edges, or its tempIds will not resolve."""
+    if not edge_tempids and which not in ("all", "vertical", "top"):
+        return "ERROR: which must be 'all', 'vertical' or 'top' (got {!r})".format(which)
     R0 = radius_mm / 10.0
     RMIN = min_radius_mm / 10.0
     code = (
         "design = _require_design()\n"
         "root = design.rootComponent\n"
-        "body = root.bRepBodies.item({bi})\n"
+        "host = find_component({cn!r})\n"
+        "body = host.bRepBodies.item({bi})\n"
         "maxz = body.boundingBox.maxPoint.z\n"
         "IDS = [int(t) for t in {ids!r}.replace(' ','').split(',') if t]\n"
         "def pick_edges():\n"
         "    col = adsk.core.ObjectCollection.create()\n"
         "    L = 0.0\n"
-        "    b = root.bRepBodies.item({bi})\n"
+        "    b = host.bRepBodies.item({bi})\n"
         "    if IDS:\n"
         "        for tid in IDS:\n"
         "            try:\n"
@@ -2506,7 +2759,7 @@ def fillet_edges_smart(radius_mm: float, body_index: int = 0,
         "def face_map():\n"
         "    m = {{}}\n"
         "    try:\n"
-        "        b = root.bRepBodies.item({bi})\n"
+        "        b = host.bRepBodies.item({bi})\n"
         "        for f in b.faces:\n"
         "            try:\n"
         "                m[f.tempId] = f.area * 100.0\n"
@@ -2528,18 +2781,18 @@ def fillet_edges_smart(radius_mm: float, body_index: int = 0,
         "            print('no edges selected (tempids=%s which=%s)' % (IDS, {w!r}))\n"
         "            break\n"
         "        vol_before = sum((b.volume if b.isValid else 0)\n"
-        "                         for b in root.bRepBodies)\n"
+        "                         for b in host.bRepBodies)\n"
         "        faces_before = face_map()\n"
         "        marker = design.timeline.markerPosition\n"
         "        try:\n"
-        "            fil = root.features.filletFeatures\n"
+        "            fil = host.features.filletFeatures\n"
         "            inp = fil.createInput()\n"
         "            inp.isRollingBallCorner = True\n"
         "            inp.addConstantRadiusEdgeSet(\n"
         "                edges, adsk.core.ValueInput.createByReal(r), chain)\n"
         "            fil.add(inp)\n"
         "            vol_after = sum((b.volume if b.isValid else 0)\n"
-        "                            for b in root.bRepBodies)\n"
+        "                            for b in host.bRepBodies)\n"
         "            delta_mm3 = abs(vol_after - vol_before) * 1000.0\n"
         "            exp_mm3 = 0.1 * ((r*10.0) ** 2) * Lmm\n"
         "            faces_after = face_map()\n"
@@ -2593,7 +2846,8 @@ def fillet_edges_smart(radius_mm: float, body_index: int = 0,
         "    print('Next: narrow the selection with select_edges (face_pair / z '\n"
         "          'range / min_len), run fillet_preview to spot faces smaller than '\n"
         "          '4r^2, or pass the raw error to explain_fillet_error.')\n"
-    ).format(bi=body_index, w=which, R0=R0, RMIN=RMIN, ids=edge_tempids)
+    ).format(bi=body_index, w=which, R0=R0, RMIN=RMIN, ids=edge_tempids,
+             cn=component_name)
     return _send(code)
 
 
@@ -2618,12 +2872,7 @@ def select_edges(body_index: int = 0, face_pair: str = "", z_min_mm: float = Non
         "design = _require_design()\n"
         "root = design.rootComponent\n"
         "cn = {cn!r}\n"
-        "host = root\n"
-        "if cn:\n"
-        "    for occ in root.allOccurrences:\n"
-        "        if occ.component.name == cn:\n"
-        "            host = occ.component\n"
-        "            break\n"
+        "host = find_component(cn)   # raises on a miss; never falls back to root\n"
         "body = host.bRepBodies.item({bi})\n"
         "want_pair = {fp!r}\n"
         "zmin = {zmin!r}\n"
@@ -2668,18 +2917,20 @@ def select_edges(body_index: int = 0, face_pair: str = "", z_min_mm: float = Non
 
 
 @mcp.tool()
-def fillet_preview(radius_mm: float, edge_tempids: str, body_index: int = 0) -> str:
+def fillet_preview(radius_mm: float, edge_tempids: str, body_index: int = 0,
+                   component_name: str = "") -> str:
     """Report what a fillet WOULD affect before you commit it: the selected
     edges, their adjacent faces, and - critically - any adjacent face whose area
     is smaller than ~4r^2, which is the signature of a radius too big for the
     feature it lands on. That is the case where a fillet silently CONSUMES a
     small face (e.g. a 1.3 mm rim annulus) and rounds the feature away while the
-    volume delta still looks reasonable."""
+    volume delta still looks reasonable. component_name: the component that
+    owns the body (empty = root), as passed to select_edges."""
     R = radius_mm
     code = (
         "design = _require_design()\n"
         "root = design.rootComponent\n"
-        "body = root.bRepBodies.item({bi})\n"
+        "body = find_component({cn!r}).bRepBodies.item({bi})\n"
         "ids = [int(t) for t in {ids!r}.replace(' ','').split(',') if t]\n"
         "r = {R}\n"
         "thresh = 4.0 * r * r\n"
@@ -2714,7 +2965,7 @@ def fillet_preview(radius_mm: float, edge_tempids: str, body_index: int = 0) -> 
         "if risky:\n"
         "    print('WARNING: %d adjacent face(s) smaller than 4r^2. Reduce the '\n"
         "          'radius or narrow the edge selection before committing.' % risky)\n"
-    ).format(bi=body_index, ids=edge_tempids, R=R)
+    ).format(bi=body_index, ids=edge_tempids, R=R, cn=component_name)
     return _send(code, compact=False)
 
 
@@ -2796,12 +3047,7 @@ def sweep_tube_check(path_sketch_index: int = -1, tube_radius_mm: float = 1.0,
         "design = _require_design()\n"
         "root = design.rootComponent\n"
         "cn = {cn!r}\n"
-        "host = root\n"
-        "if cn:\n"
-        "    for occ in root.allOccurrences:\n"
-        "        if occ.component.name == cn:\n"
-        "            host = occ.component\n"
-        "            break\n"
+        "host = find_component(cn)   # raises on a miss; never falls back to root\n"
         "si = {si}\n"
         "sk = host.sketches.item(host.sketches.count - 1 if si < 0 else si)\n"
         "R = {R}\n"
@@ -2875,12 +3121,7 @@ def respline(points_json: str, sketch_index: int = -1, curve_index: int = 0,
         "design = _require_design()\n"
         "root = design.rootComponent\n"
         "cn = {cn!r}\n"
-        "host = root\n"
-        "if cn:\n"
-        "    for occ in root.allOccurrences:\n"
-        "        if occ.component.name == cn:\n"
-        "            host = occ.component\n"
-        "            break\n"
+        "host = find_component(cn)   # raises on a miss; never falls back to root\n"
         "si = {si}\n"
         "sk = host.sketches.item(host.sketches.count - 1 if si < 0 else si)\n"
         "PTS = {pts!r}\n"
@@ -2951,9 +3192,11 @@ def run_batch(operations_json: str, stop_on_error: bool = True) -> str:
         {"tool":"fillet_edges","args":{"radius_mm":2,"which":"vertical"}}]'
 
     Each operation prints its own output, prefixed with its index, so you still
-    see per-step volume deltas and warnings. stop_on_error=True aborts the batch
-    at the first exception (recommended - later steps usually depend on earlier
-    ones); False runs them all and reports which failed.
+    see per-step volume deltas and warnings. stop_on_error=True (recommended -
+    later steps usually depend on earlier ones) stops at the first op that
+    raises OR whose output reports a failure (ERROR, WARNING, ***, FAILED,
+    NOT CREATED, ...) - most tools report failure by printing, not raising.
+    False runs them all and lists which failed or were flagged.
 
     Use for any sequence of 3+ known operations. Not for steps whose arguments
     depend on the result of an earlier step - those genuinely need round trips."""
@@ -2993,38 +3236,72 @@ def run_batch(operations_json: str, stop_on_error: bool = True) -> str:
             name = op.get("tool")
             args = op.get("args") or {}
             fn = registry.get(name)
-            if fn is None:
-                _batch_mode[0] = False
-                return "ERROR: op {}: unknown tool {!r}".format(i, name)
             before = len(_batch_buf)
             try:
-                fn(**args)
+                res = fn(**args)
             except TypeError as e:
-                _batch_mode[0] = False
                 return "ERROR: op {} ({}): bad arguments - {}".format(i, name, e)
+            except Exception as e:
+                return "ERROR: op {} ({}): {}".format(i, name, e)
             if len(_batch_buf) == before:
-                _batch_mode[0] = False
-                return ("ERROR: op {} ({}) produced no code - it may have failed "
-                        "argument validation.".format(i, name))
+                # the tool validated its arguments and refused before
+                # generating any code - pass its own message through
+                return ("ERROR: op {} ({}) was rejected before anything ran: {}"
+                        .format(i, name, res))
             fragments.append((i, name, _batch_buf[before]))
     finally:
         _batch_mode[0] = False
         _batch_lock.release()
 
-    parts = ["print('=== batch: {} operation(s) ===')".format(len(fragments))]
-    for i, name, frag in fragments:
-        parts.append("print('--- [{}] {} ---')".format(i, name))
-        parts.append("try:")
-        parts.append(_indent(frag, 4))
-        parts.append("    progress('op {} ({}) ok')".format(i, name))
-        parts.append("except Exception as _be:")
-        parts.append("    import traceback as _tb")
-        parts.append("    print('*** op {} ({}) FAILED: ' + str(_be)[:150])".format(i, name))
-        parts.append("    print(_tb.format_exc()[-400:])")
-        if stop_on_error:
-            parts.append("    raise")
-    parts.append("print('=== batch complete ===')")
-    return _send("\n".join(parts) + "\n")
+    # Each op runs as its own compiled string. It used to be re-indented into
+    # a try: block, which rewrote multi-line string literals inside
+    # run_fusion_code ops and shifted traceback line numbers. Each op's printed
+    # output is captured so stop_on_error can act on REPORTED failures.
+    code = (
+        "import sys as _mcp_sys, contextlib as _mcp_cl, traceback as _mcp_tb\n"
+        "_MCP_OPS = " + repr(fragments) + "\n"
+        "_MCP_STOP = " + repr(bool(stop_on_error)) + "\n"
+        "_MCP_MARKERS = " + repr(_BATCH_STOP_MARKERS) + "\n"
+        "class _McpOpTee(object):\n"
+        "    def __init__(self, inner):\n"
+        "        self.inner = inner\n"
+        "        self.parts = []\n"
+        "    def write(self, s):\n"
+        "        self.parts.append(s)\n"
+        "        return self.inner.write(s)\n"
+        "    def flush(self):\n"
+        "        pass\n"
+        "_mcp_flagged = []\n"
+        "print('=== batch: %d operation(s) ===' % len(_MCP_OPS))\n"
+        "for _mcp_i, _mcp_name, _mcp_src in _MCP_OPS:\n"
+        "    print('--- [%d] %s ---' % (_mcp_i, _mcp_name))\n"
+        "    _mcp_t = _McpOpTee(_mcp_sys.stdout)\n"
+        "    try:\n"
+        "        with _mcp_cl.redirect_stdout(_mcp_t):\n"
+        "            exec(compile(_mcp_src, '<batch op %d: %s>' % (_mcp_i, _mcp_name),\n"
+        "                         'exec'), globals())\n"
+        "    except Exception as _mcp_be:\n"
+        "        print('*** op %d (%s) FAILED: %s' % (_mcp_i, _mcp_name, str(_mcp_be)[:150]))\n"
+        "        print(_mcp_tb.format_exc()[-400:])\n"
+        "        if _MCP_STOP:\n"
+        "            raise\n"
+        "        _mcp_flagged.append(_mcp_i)\n"
+        "        continue\n"
+        "    _mcp_hit = [m for m in _MCP_MARKERS if m in ''.join(_mcp_t.parts)]\n"
+        "    if _mcp_hit:\n"
+        "        _mcp_flagged.append(_mcp_i)\n"
+        "        if _MCP_STOP:\n"
+        "            raise RuntimeError('batch STOPPED at op %d (%s): its output reports '\n"
+        "                               '%r. Ops after it were NOT run.'\n"
+        "                               % (_mcp_i, _mcp_name, _mcp_hit[0]))\n"
+        "        continue\n"
+        "    progress('op %d (%s) ok' % (_mcp_i, _mcp_name))\n"
+        "if _mcp_flagged:\n"
+        "    print('=== batch complete: op(s) %s FAILED or flagged ===' % _mcp_flagged)\n"
+        "else:\n"
+        "    print('=== batch complete: all %d op(s) ok ===' % len(_MCP_OPS))\n"
+    )
+    return _send(code)
 
 
 @mcp.tool()

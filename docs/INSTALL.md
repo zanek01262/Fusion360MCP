@@ -40,6 +40,15 @@ the type carefully.
 > and restart the add-in (Stop > Run). A stale add-in with a newer server now
 > reports PROTOCOL MISMATCH instead of failing silently.
 >
+> **Upgrading to 1.9.0 or later: update both files.** 1.9.0 changed the wire
+> protocol (to 3), so a new server and an old add-in refuse to work together
+> until both are current.
+>
+> Each time it starts, the add-in writes a random auth token to
+> `~/.fusion_mcp/listener_token` (readable only by you). The server reads it
+> automatically — there's nothing to configure. It stops web pages in your
+> browser from sending code to the listener.
+>
 > Leave Fusion open while using Claude. With "Run on Startup" ticked, the
 > listener auto-starts each time Fusion launches.
 
@@ -121,7 +130,9 @@ and scripts are registered differently.
    - **macOS/Linux:** `./launch.sh` (run `chmod +x launch.sh` once first)
 
    Everything should read **OK**. If `requests` or `mcp` shows FAIL, redo the
-   `python -m pip install` with the right interpreter.
+   `python -m pip install` with the right interpreter. The listener check also
+   confirms the add-in speaks the same protocol and version as the server and
+   accepts the auth token — so a stale add-in shows up here, not mid-session.
 2. In Claude Desktop, confirm the `fusion360` tools appear (tools/connector
    icon near the chat box), then ask:
    > **Ping Fusion.**
@@ -175,6 +186,12 @@ fully restart Claude Desktop. A quick JSON sanity check:
 python -m json.tool < "path/to/claude_desktop_config.json"
 ```
 If that errors, your JSON is malformed.
+
+**"AUTH ERROR" from a tool, or "auth token rejected" in the preflight.**
+The listener refused the token the server sent. Stop → Run the add-in (Shift+S →
+Add-Ins → MCPListener) so it writes a fresh token. If it keeps happening, Fusion
+and Claude Desktop are running as different OS users — they need to be the same
+user, because the token file lives in your home folder.
 
 **"Connection error" when a tool runs, but the server is fine.**
 That's the *listener* — Fusion isn't open, or the add-in isn't running. Shift+S

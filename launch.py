@@ -25,12 +25,15 @@ Usage:
 
 import json
 import os
+import re
 import sys
 import subprocess
 
 LISTENER_URL = "http://127.0.0.1:8765"
 HERE = os.path.dirname(os.path.abspath(__file__))
 SERVER = os.path.join(HERE, "fusion_mcp_server.py")
+# Written by the listener at startup; see the Security note in MCPListener.py.
+TOKEN_PATH = os.path.join(os.path.expanduser("~"), ".fusion_mcp", "listener_token")
 
 # ---- tiny ANSI helpers (no deps) ----
 def _c(code, s):
@@ -79,22 +82,69 @@ def check_server_file():
     return False
 
 
+def _server_constants():
+    """(SERVER_VERSION, EXPECTED_PROTOCOL) read from the server file itself,
+    so the preflight checks against the server Claude Desktop will actually
+    run - without importing it, which needs the mcp SDK that may be what is
+    missing."""
+    try:
+        with open(SERVER, encoding="utf-8") as f:
+            src = f.read()
+        v = re.search(r'^SERVER_VERSION = "([^"]+)"', src, re.M)
+        p = re.search(r'^EXPECTED_PROTOCOL = (\d+)', src, re.M)
+        return (v.group(1) if v else None, int(p.group(1)) if p else None)
+    except Exception:
+        return (None, None)
+
+
 def check_listener():
+    """Reachable, same protocol and version as the server, and accepting the
+    auth token - a stale add-in is the most common upgrade failure."""
     try:
         import requests
     except Exception:
         print(warn("can't check listener (requests missing)"))
         return False
     try:
-        r = requests.get(LISTENER_URL, timeout=5)
-        msg = r.json().get("output", "")
-        print(ok("Fusion listener reachable — {}".format(msg)))
-        return True
+        d = requests.get(LISTENER_URL + "/ping", timeout=5).json()
     except Exception:
         print(bad("Fusion listener NOT reachable at {}".format(LISTENER_URL)))
         print("       fix: open Fusion 360 -> Shift+S -> Add-Ins ->")
         print("            select MCPListener -> Run")
         return False
+    sv, sp = _server_constants()
+    lv, lp = d.get("listener_version"), d.get("protocol")
+    print(ok("Fusion listener reachable (listener v{}, protocol {})".format(lv, lp)))
+    if sp is not None and lp != sp:
+        print(bad("protocol mismatch: listener speaks {}, this server expects {}"
+                  .format(lp, sp)))
+        print("       fix: copy this folder's MCPListener.py into Fusion's AddIns")
+        print("            folder (docs/INSTALL.md Part A), then Shift+S ->")
+        print("            Add-Ins -> MCPListener -> Stop -> Run")
+        return False
+    if sv and lv != sv:
+        print(warn("version differs: server v{} vs listener v{} - update "
+                   "whichever is older".format(sv, lv)))
+    try:
+        with open(TOKEN_PATH, encoding="utf-8") as f:
+            tok = f.read().strip()
+    except OSError:
+        print(bad("auth token file missing: {}".format(TOKEN_PATH)))
+        print("       fix: Stop -> Run the add-in; it writes this file at startup")
+        return False
+    try:
+        r = requests.get(LISTENER_URL + "/state",
+                         headers={"X-MCP-Token": tok}, timeout=5)
+    except Exception as e:
+        print(bad("listener stopped answering during the auth check: {}".format(e)))
+        return False
+    if r.status_code == 401:
+        print(bad("auth token rejected - {} is from an earlier run".format(TOKEN_PATH)))
+        print("       fix: Stop -> Run the add-in, and make sure Fusion and")
+        print("            Claude Desktop run as the same OS user")
+        return False
+    print(ok("auth token accepted"))
+    return True
 
 
 def _claude_config_path():
@@ -112,10 +162,10 @@ def check_claude_config():
     path = _claude_config_path()
     if not os.path.exists(path):
         print(warn("Claude Desktop config not found at {}".format(path)))
-        print("       (fine if you haven't set it up yet — see README Part C)")
+        print("       (fine if you haven't set it up yet — see docs/INSTALL.md Part C)")
         return False
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             cfg = json.load(f)
     except Exception as e:
         print(bad("Claude config exists but won't parse: {}".format(e)))
@@ -124,15 +174,24 @@ def check_claude_config():
     if "fusion360" in servers:
         entry = servers["fusion360"]
         args = entry.get("args", [])
-        configured = args[0] if args else "(none)"
+        # The server path is not always args[0]: "-u", "run", "--with mcp"
+        # and friends come first in some configs.
+        configured = next((a for a in args if str(a).replace("\\", "/")
+                           .endswith("fusion_mcp_server.py")), None)
+        if configured is None:
+            print(warn("Claude config has 'fusion360', but no argument ends in "
+                       "fusion_mcp_server.py"))
+            print("        args: {}".format(args))
+            return True
         print(ok("Claude config has 'fusion360' -> {}".format(configured)))
-        if os.path.abspath(configured) != os.path.abspath(SERVER):
+        if (os.path.normcase(os.path.abspath(configured))
+                != os.path.normcase(os.path.abspath(SERVER))):
             print(warn("   configured path differs from this folder's server:"))
             print("        configured: {}".format(configured))
             print("        this file : {}".format(SERVER))
         return True
     print(warn("Claude config found but no 'fusion360' server entry"))
-    print("       see README Part C")
+    print("       see docs/INSTALL.md Part C")
     return False
 
 
@@ -172,7 +231,11 @@ def cmd_serve():
     print(head("Running MCP server standalone (Ctrl+C to stop)…"), file=sys.stderr)
     print("Note: over stdio this just waits for JSON-RPC; that's expected.",
           file=sys.stderr)
-    # exec the server with the same interpreter
+    if os.name == "nt":
+        # os.execv on Windows starts a NEW process and exits this one, which
+        # drops the stdio pipe a client such as MCP Inspector is holding.
+        return subprocess.call([sys.executable, SERVER])
+    # POSIX: replace this process, keeping stdio attached
     os.execv(sys.executable, [sys.executable, SERVER])
 
 

@@ -45,12 +45,38 @@ If people send PRs, the easiest things to review are new `@mcp.tool()` functions
 that follow the existing patterns (mm in, cm to the API, print a clear result,
 guard lookups). See `docs/ARCHITECTURE.md` → "Extending the toolset."
 
+## Tests
+
+`python -m pip install -r requirements-dev.txt`, then `python -m pytest`. The
+suite needs no Fusion 360, and `.github/workflows/tests.yml` runs it on every
+push and pull request (Windows and Linux, Python 3.10 and 3.12).
+
 ## Releases
 
 `RELEASE_NOTES.md` at the package root holds the notes for the CURRENT release —
 paste its contents straight into the GitHub release body. `CHANGELOG.md` remains
 the full per-version history; RELEASE_NOTES is the narrative summary for the
 version being published.
+
+**Bumping the version** — `tests/test_versions.py` fails until all of these
+agree:
+- `SERVER_VERSION` in `fusion_mcp_server.py` (the source of truth)
+- `LISTENER_VERSION` in `MCPListener.py` — bump it every release, even when
+  the listener didn't change, or `ping_fusion` warns every user about a
+  "stale" add-in
+- the `[server vX.Y.Z]` line in the `run_fusion_code` docstring
+- the top `##` entry of `CHANGELOG.md`, the `# vX.Y.Z` title of
+  `RELEASE_NOTES.md`, and the version in `README.md`
+
+`docs/render_pdfs.py` reads the version itself.
+
+**PDFs are release assets, not repo files.** Build and attach them:
+
+```bash
+python -m pip install weasyprint markdown pypdf
+python docs/render_pdfs.py
+gh release upload X.Y.Z docs/pdf/*.pdf   # tags here are bare versions, e.g. 1.9.0
+```
 
 Tag versions so people can grab a stable zip:
 
