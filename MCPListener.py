@@ -45,7 +45,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PORT = 8765
 # Kept in lockstep with SERVER_VERSION in fusion_mcp_server.py - ping_fusion
 # compares them, and tests/test_versions.py fails the build on any drift.
-LISTENER_VERSION = '1.9.0'
+LISTENER_VERSION = '1.9.1'
 PROTOCOL = 3   # bump when the wire schema changes (3: token auth, budget flag)
 CUSTOM_EVENT_ID = 'MCPListenerExec'
 DEFAULT_BUDGET_S = 600.0   # soft budget; job is FLAGGED budget_exceeded past this

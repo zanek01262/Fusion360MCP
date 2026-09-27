@@ -134,8 +134,12 @@ Rectangle on XY extruded up by height. Returns new body name.
 Circle on XY extruded up.
 
 ### `drill_hole(diameter_mm, x_mm, y_mm, depth_mm, body_index=0)`
-Cut a hole straight down from XY at (x, y) to depth. Cuts **only** body
-`body_index`; other bodies the hole passes through are untouched.
+Cut a hole straight down at (x, y), `depth_mm` deep measured from the **top of
+body `body_index`** (its highest point). Cuts **only** that body; other bodies
+the hole passes through are untouched. The drilling plane is a hidden
+construction plane named `mcp_hole_plane_z<height>mm`, shared by every hole at
+that height. (Before 1.9.1 these tools sketched at z = 0 and cut toward −Z,
+missing any body built upward from XY — including every `create_box` body.)
 
 ### `fillet_edges(radius_mm, body_index=0, which="all")`
 Round edges. `which`: `all` / `vertical` (vertical-running edges) / `top`
@@ -146,7 +150,8 @@ Hollow to a wall thickness. `open_top=True` removes the top face (open box);
 `False` makes a closed hollow body.
 
 ### `tapped_hole(thread_size, x_mm, y_mm, depth_mm, body_index=0, tap_drill_only=True, tap_drill_mm=None)`
-Tapped hole on the top (XY) plane, cutting down into body `body_index` only.
+Tapped hole at (x, y), cut straight down from the **top of body
+`body_index`**, into that body only — same plane handling as `drill_hole`.
 `thread_size` is case-insensitive: `M3`, `m4`, `M4x0.7`, `M8x1`, `#6-32`,
 `10-32`, `1/4-20`, `1/4-20 UNC`.
 - **Metric:** drill = major − pitch, so any pitch works (`M8x1` → 7.0 mm). The
@@ -157,9 +162,10 @@ Tapped hole on the top (XY) plane, cutting down into body `body_index` only.
   `tap_drill_mm` to size the hole yourself.
 - `tap_drill_only=True` (default): cuts only the tap-drill hole — best for
   3D-printed and hand-tapped parts.
-- `False`: also applies a **modeled** thread (visualization / CNC). If Fusion
-  has no matching designation it prints a `WARNING` with the reason; the
-  tap-drill hole is still cut.
+- `False`: also applies a **modeled** thread (visualization / CNC) with the
+  usual fit — `6H` metric, `2B` unified (e.g. `M3x0.5 6H`, `1/4-20 UNC 2B`). If
+  Fusion has no matching designation it prints a `WARNING` with the reason; the
+  tap-drill hole is still cut. (Modeled threads never applied before 1.9.1.)
 
 ---
 
@@ -238,6 +244,10 @@ Reposition the camera without returning an image.
 
 ## Components & occurrences
 
+> **Needs an Assembly design.** Fusion refuses a second component in a **Part**
+> design ("Part Design documents can only contain one component"). Every tool in
+> this section and in *Joints* needs an Assembly design open.
+
 A **component** is a part definition; an **occurrence** is one placed instance
 of it, named like `Screw:1`, `Screw:2` (shown by `list_components`). Copies
 made by `copy_component` share one component, so:
@@ -255,7 +265,9 @@ made by `copy_component` share one component, so:
 New empty component as an occurrence at the origin. One per distinct part.
 
 ### `list_components()`
-All occurrences: fullPathName, component name, origin position (mm).
+All occurrences: fullPathName, component name, origin position (mm), and
+grounding — `grounded`, `grounded to parent`, or `free`. Only a free part can be
+moved by a joint.
 
 ### `box_in_component(component_name, length_mm, width_mm, height_mm, ox_mm=0, oy_mm=0, oz_mm=0)`
 Box built inside a named component on its own XY plane. `component_name` is
@@ -272,7 +284,10 @@ repeated hardware. Address the copies by occurrence name afterwards.
 
 ### `ground_component(component_name, grounded=True)`
 Lock/unlock one occurrence in space. Ground exactly one base per assembly,
-first.
+first. Fusion has two grounding flags, `isGrounded` and a separate "ground to
+parent"; a part can carry the second with the first off and still be fixed.
+Ungrounding clears both, and the tool reads them back — **CONFIRMED** only when
+the part is really in the requested state, **NOT APPLIED** otherwise.
 
 ---
 
@@ -282,14 +297,26 @@ Joints reference component **origins** (or explicit points). To pivot at a
 specific location, design the component so its local origin sits there, or use
 `joint_at_point`. Position parts first; joints override transforms after.
 
+**Fusion moves `component_a` onto `component_b`** — pass the grounded base as
+`component_b`. An explicitly grounded `component_a` is refused before anything
+is built. One that is only "grounded to parent" is freed, and the output says
+so. **CONFIRMED** means the joint solved *and* its two points coincide: Fusion
+will add a joint it cannot solve and only flag its health, so the joint count
+going up proves nothing. A joint Fusion rejects leaves no helper geometry
+behind.
+
 ### `rigid_joint(component_a, component_b)`
-Lock two components rigidly at their current relative position.
+Rigid joint between the two components' **origin points**: component_a's origin
+is moved onto component_b's.
 
 ### `revolute_joint(component_a, component_b, axis="z")`
 One rotational DOF about `axis` (x/y/z). Hinges, lids, arms.
 
 ### `joint_at_point(component_a, ax_mm, ay_mm, az_mm, component_b, bx_mm, by_mm, bz_mm, motion="rigid", axis="z")`
 Joint at explicit local points on each component. `motion`: rigid/revolute.
+Places a hidden sketch point (sketch `mcp_joint_point`) in each component. It
+used construction points before 1.9.1, which Fusion refuses in parametric
+designs ("Environment is not supported").
 
 ### `list_joints()`
 All joints and their motion type.
@@ -518,7 +545,9 @@ Check a sweep **path** before sweeping. `ASM_SELF_INTER` on a circular-profile
 sweep blames the profile or taper angle, but the cause is almost always the
 path: if its minimum curvature radius is below the tube radius, the swept body
 self-intersects. Reports minimum curvature radius, where it occurs, and total
-path length.
+path length. A path of straight segments only is reported as such, with a
+reminder that sharp corners act as zero radius. (Before 1.9.1 it misread
+Fusion's curvature result and reported "could not measure" for every path.)
 
 ### `respline(points_json, sketch_index=-1, curve_index=0, plane="xy", component_name="")`
 Rebuild a fitted spline with a **new** set of fit points — Fusion lets you move
@@ -559,7 +588,8 @@ These are now checked rather than assumed:
 | `save_document` | Version bump / modified-flag cleared / lineage appeared → **CONFIRMED**, else **UNCONFIRMED**. |
 | `export_step` / `export_stl` / `export_dxf` | The export call's return value, **and** the file was written by *this* call (its modification time changed) with non-zero size → **CONFIRMED**. A file left at the path by an earlier export no longer passes. |
 | `set_parameter` | The stored expression is **read back** and compared. Fusion silently rejects or clamps expressions it dislikes. |
-| `rigid_joint` / `revolute_joint` / `joint_at_point` | Joint **count increased**. |
+| `rigid_joint` / `revolute_joint` / `joint_at_point` | The joint is **healthy** and its two points **coincide** in world space → **CONFIRMED**; otherwise **NOT SOLVED** / **UNCONFIRMED**. |
+| `ground_component` | Both grounding flags read back and match the request → **CONFIRMED**, else **NOT APPLIED**. |
 | `drill_hole` / `hole_on_face` / `tapped_hole` / `shell_body` | Volume delta, with a no-op warning. Holes cut only the target body. `tapped_hole` refuses a size it can't look up rather than guessing a drill. |
 | `run_fusion_code_safe` | After a failure, the timeline count is back where it started → **ROLLED BACK**, else **ROLLBACK INCOMPLETE**. |
 | Component / occurrence names | Resolved or refused — never a silent fallback to the root component or to the first of several copies. |

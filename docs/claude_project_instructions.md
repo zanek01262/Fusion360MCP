@@ -187,6 +187,9 @@ CURVED SURFACES & MANY-CUT PATTERNS
   code use tbm() and commit_tool_body().
 
 ASSEMBLIES
+- Components and joints need an ASSEMBLY design. A Part design holds exactly one
+  component - create_component fails there ("add this Part to an Assembly").
+  Tell the user to open or create an Assembly design; do not work around it.
 - One component per distinct part; repeated hardware = one component with
   multiple occurrences via copy_component.
 - Copies are occurrences named 'Screw:1', 'Screw:2' (see list_components).
@@ -195,6 +198,10 @@ ASSEMBLIES
   ambiguous and is refused.
 - Ground exactly one base component, position others, THEN joint. Joints win
   over transforms.
+- Joints move component_a onto component_b: pass the grounded base as
+  component_b. Only CONFIRMED means joined - "NOT SOLVED" or "UNCONFIRMED"
+  means the parts are NOT joined; check list_components (grounded / grounded
+  to parent / free) before retrying.
 
 WHEN TO USE RAW CODE
 - Canned tools cover boxes, cylinders, holes, fillets, shells, tapped holes,

@@ -1,142 +1,93 @@
-# v1.9.0 — Localhost hardening and honest failure reporting
+# v1.9.1 — Fixes found by a live Fusion run
 
-A review of the whole codebase found one security hole, and a set of places
-where a tool reported a success it hadn't earned or quietly did something other
-than what was asked. This release fixes them, and adds a test suite that runs
-without Fusion.
+1.9.0's test suite runs without Fusion, against simulated API objects. Running
+the tools in a real Fusion session found six bugs those simulations couldn't
+catch. Each came from code written against the wrong API behaviour, or from a
+success check that trusted the wrong signal, and all predate 1.9.0. All six are
+fixed and re-verified in Fusion.
 
-## ⚠️ Upgrading — read this
+## Upgrading
 
-**Update both files. 1.9.0 changes the wire protocol (2 → 3)**, so a new server
-and an old add-in refuse to work together until both are current.
+Update both files, as with every release (the versions move in lockstep):
 
 | File | Goes to |
 |---|---|
 | `fusion_mcp_server.py` | your project folder (whatever `claude_desktop_config.json` points at) → restart Claude Desktop |
 | `MCPListener.py` | `%appdata%\Autodesk\Autodesk Fusion 360\API\AddIns\MCPListener\` → Shift+S → MCPListener → **Stop → Run** |
 
-Then run the preflight (`launch.bat` / `./launch.sh`), which now checks the
-protocol, version and auth token, or ask Claude to **"Ping Fusion."** Expect
-`server v1.9.0 | listener v1.9.0`.
+- **From 1.9.0:** nothing else changes — same protocol (3), same auth token.
+- **From 1.8.x or earlier:** 1.9.0 changed the wire protocol and added an auth
+  token; see the v1.9.0 release notes. A new server and an old add-in refuse
+  to work together until both are current.
 
-There's nothing to configure for the new auth token: the add-in writes it and
-the server reads it.
+Then run the preflight (`launch.bat` / `./launch.sh`) or ask Claude to
+**"Ping Fusion."** Expect `server v1.9.1 | listener v1.9.1`.
 
-## Security: web pages could run code through the listener
+## Fixes — each verified in a live Fusion session
 
-Binding to `127.0.0.1` kept the network out, but not your browser. Any page you
-visited could POST to `http://127.0.0.1:8765/exec`. A plain-text request needs
-no CORS preflight, so the browser sends it without asking, and the listener
-ran the code with your full user permissions. A DNS-rebinding site could reach
-it the same way.
+- **Holes are cut from the body's top.** `drill_hole` and `tapped_hole`
+  sketched at z = 0 and cut toward −Z, so they missed every body built upward
+  from XY, including everything `create_box` makes. Their own "no effect"
+  warning fired, so nothing was damaged, but the holes never landed. They now
+  start at the target body's top. Verified:
+  - a 5 mm hole removes exactly the expected 35.3 mm³;
+  - a 15 mm hole into the upper of two stacked bodies removes 70.69 mm³ from
+    it, while the body below keeps its exact volume and stays solid at the
+    hole position.
+- **Modeled threads work.** `tapped_hole(tap_drill_only=False)` called thread
+  lookup methods that don't exist (`getAllSizes` and friends), so a modeled
+  thread never applied. It now uses the real API and Fusion's actual size
+  naming. Verified: `M3x0.5 6H` and `1/4-20 UNC 2B`.
+- **`sweep_tube_check` measures curvature.** It read Fusion's curvature result
+  as two values when Fusion returns three, so every path reported "could not
+  measure curvature". Verified on a path with a 10 mm arc: it reports
+  10.000 mm, and warns that a 12 mm tube won't fit. Evaluation errors now print
+  a WARNING instead of being swallowed.
+- **`joint_at_point` works.** Fusion refuses construction points built from
+  raw coordinates in parametric designs ("Environment is not supported"). It
+  now places a hidden sketch point in each component. Verified end to end in an
+  Assembly design: the joint solves, and the two points coincide.
+- **Joints no longer claim success when they didn't solve.** Fusion will add a
+  joint it can't solve and only flag its health, so "the joint count went up"
+  proved nothing. CONFIRMED now requires the joint to be healthy **and** its two
+  points to coincide; otherwise it says NOT SOLVED or UNCONFIRMED.
+  - Fusion moves `component_a` onto `component_b`. An explicitly grounded
+    `component_a` is now refused up front with that explanation, instead of
+    failing inside Fusion.
+  - A rejected joint no longer leaves helper geometry behind.
+- **`ground_component(grounded=False)` really frees the part.** Fusion has a
+  second flag, "ground to parent", and a part can carry it with `isGrounded`
+  off and still be fixed. The tool cleared only `isGrounded` and printed
+  `grounded=False` anyway. It now clears both, reads them back, and says
+  CONFIRMED or NOT APPLIED. The joint tools free a `component_a` that is only
+  grounded to its parent, and say so.
 
-Every request now needs:
+## Also
 
-- a **Host** header of `127.0.0.1` or `localhost`, which refuses DNS rebinding;
-- an **`X-MCP-Token`** header matching a random token the add-in writes to
-  `~/.fusion_mcp/listener_token` each time it starts. A page can't read that
-  file, and the custom header forces a CORS preflight the listener never
-  approves.
-
-`/ping` stays open (liveness and version only), so a version mismatch can
-still be diagnosed.
-
-## Fixes: tools that reported success without earning it
-
-- **`run_fusion_code_safe` never rolled anything back.** It called `deleteMe()`
-  on timeline items, which don't have one, swallowed the error, and printed
-  `ROLLED BACK` anyway. It now deletes through `.entity`, checks the timeline is
-  back where it started, and says `ROLLBACK INCOMPLETE` when it isn't.
-- **`ping_fusion` warned on every correct install.** 1.8.x changed only the
-  server, so the listener still reported 1.7.0. The two versions now move in
-  lockstep, enforced by a test.
-- **`get_model_state` said UNSAVED when it couldn't tell** (app.data down). That
-  misreading is what leads to saveAs and a duplicate design. It now says
-  UNKNOWN.
-- **A job that ran past its budget stayed `timeout` forever**, even after it
-  finished, so callers retried work that had completed. The overrun is now a
-  separate `budget_exceeded` flag, and the status still ends OK or ERROR.
-- **Exports could print CONFIRMED for a file from an earlier run.** They now
-  require the file to have been written by this call, and DXF export checks
-  `saveAsDXF`'s return value, which it used to ignore.
-- **`tapped_hole` silently used the wrong drill.** `m4`, `M4X0.7`, `M20`,
-  `#2-56` and `3/8-16` all got 2.5 mm, and fine-pitch `M8x1` got the coarse
-  6.8 mm.
-  - Metric drills are now major − pitch; unified sizes #0-80 to 3/4-16 come
-    from a table.
-  - An unknown size is an ERROR and nothing is cut. `tap_drill_mm` lets you
-    size the hole yourself.
-  - The modeled-thread option now matches the designation properly and uses the
-    inch thread type for unified sizes.
-- **Component names fell back to the root component on a typo**, and copies
-  couldn't be addressed, because every lookup returned the first copy. All
-  lookups now go through `find_component` / `find_occurrence`. They accept
-  occurrence names like `Screw:3`, and refuse misses and ambiguous names with a
-  list of valid ones.
-- **`run_batch(stop_on_error=True)` only stopped on exceptions.** Most tools
-  report failure by printing, so it now also stops on `ERROR`, `WARNING`, `***`,
-  `NOT CREATED` and similar.
-- **`drill_hole` and `tapped_hole` ignored `body_index`** and cut every body the
-  hole crossed. They, and `hole_on_face`, now cut only the target body.
-- **`launch.bat` reported "no python found"** on machines without the `py`
-  launcher, even with `python` on PATH.
-- **After a transport timeout, the message pointed `job_status` at the previous
-  job.**
-
-## Smaller fixes
-
-- `run_fusion_code_safe` and `run_batch` no longer re-indent your code, which
-  rewrote multi-line strings and shifted traceback line numbers.
-- **Unknown values are now errors instead of silent defaults:**
-  - joint `motion='slider'` used to build a rigid joint and print
-    "CONFIRMED: slider joint";
-  - joint `axis`, offset-plane `base`, `fillet_edges` `which` and STL `quality`
-    also fell back silently.
-- `move_component` keeps the occurrence's rotation, and `copy_component` copies
-  keep the source's.
-- `fillet_edges_smart` and `fillet_preview` take `component_name`, matching
-  `select_edges`.
-- The sliver-face threshold is 0.05 mm² everywhere; two tools still used 0.01.
-- `construction_plane_tangent`'s reference sketch is named and hidden.
-- `view_model` uses a per-call temp file instead of `~/fusion_view.png`.
-- Two open documents with the same name are no longer both marked active.
-- Stop → Run no longer leaks a watchdog thread.
-- A fillet error hint named a tool that doesn't exist (`sweep_tube`).
-- **Preflight:**
-  - checks protocol, version and token;
-  - finds the server path anywhere in the config's args;
-  - `serve` now works with MCP Inspector on Windows.
-
-## Project
-
-- **Test suite** (`tests/`, 178 tests, needs no Fusion):
-  - compiles every tool's generated code;
-  - runs the rollback and batch logic against fakes;
-  - drives the listener's request guard over real HTTP.
-
-  CI runs it on Windows and Linux for every push.
-- **One version number**, enforced by a test.
-- **PDFs are release assets** now, not committed files.
-- `mcp[cli]` is capped below 2.
+- **Assembly tools need an Assembly design.** Fusion's Part designs hold a
+  single component; `create_component` fails there with "Part Design documents
+  can only contain one component". Now documented in TOOLS, INSTALL and the
+  project instructions.
+- **`list_components` shows grounding** for each part: `grounded`,
+  `grounded to parent` or `free`.
+- **Docs corrected:** `rigid_joint` moves component_a's origin onto
+  component_b's. It was documented as locking the parts "at their current
+  relative position", which it never did.
+- **Drilling planes are shared.** Each is a hidden construction plane named
+  `mcp_hole_plane_z<height>mm`, reused by every hole at that height.
+- **Tests: 204** (up from 178). The new ones reproduce the API behaviour Fusion
+  actually showed, and fail against 1.9.0.
 
 ## Known limitations
 
-- **Not yet checked in a live Fusion session.** Three suspected issues from the
-  same review still need a real Fusion run:
-  - whether `drill_hole` / `tapped_hole` (sketch at z=0, cut toward −Z) reach a
-    box built by `create_box` (z from 0 upward);
-  - whether `sweep_tube_check` unpacks `getCurvature` correctly;
-  - whether `joint_at_point`'s construction points work in parametric designs.
-
-  The new modeled-thread matching and `participantBodies` targeting follow the
-  API documentation but are also untested live.
 - **`open_document` / `list_recent_designs` / `list_versions` require
   `app.data`.** When it's broken for a session there is no workaround — open the
   design in the Fusion UI.
 - **`defineAsFreeMove` and `defineAsOffset` are refused** by the listener; the
   former hard-crashes the Fusion host.
-- **The tests use simulated `adsk` objects.** Treat the first run of any release
-  as a shakedown and keep your work saved.
+- **The tests use simulated `adsk` objects.** This release is the case for
+  still doing live runs: treat the first run of any release as a shakedown and
+  keep your work saved.
 
-Full per-version history: `CHANGELOG.md`. The v1.8.1 notes (everything from
-v1.4.1 to v1.8.1) remain on the v1.8.1 GitHub release.
+Full per-version history: `CHANGELOG.md`. The v1.9.0 notes (the security fix
+and the protocol change) remain on the v1.9.0 GitHub release.

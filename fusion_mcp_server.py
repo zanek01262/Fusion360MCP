@@ -62,7 +62,7 @@ def _compact(text: str) -> str:
 # The one version number. MCPListener.LISTENER_VERSION must match (the
 # listener lives in a separate folder, so it cannot import this);
 # tests/test_versions.py fails the build if any copy drifts.
-SERVER_VERSION = "1.9.0"
+SERVER_VERSION = "1.9.1"
 EXPECTED_PROTOCOL = 3
 
 # Auth token the listener writes at startup (see MCPListener.py). Read fresh on
@@ -562,7 +562,7 @@ def job_status(job_id: str) -> str:
 @mcp.tool()
 def run_fusion_code(code: str) -> str:
     """Execute arbitrary Python inside the running Fusion 360 session.
-    [server v1.9.0 - if this looks old, Claude Desktop is showing a CACHED tool
+    [server v1.9.1 - if this looks old, Claude Desktop is showing a CACHED tool
      schema; fully restart it.]
 
     `adsk`, `app`, `ui` are in scope, plus ~30 injected helpers. Fusion's API is
@@ -852,13 +852,34 @@ def create_cylinder(diameter_mm: float, height_mm: float,
     return _send(code)
 
 
+# Generated-code fragment shared by the XY hole tools. Expects `root` and
+# `body`; leaves `sk` (a sketch on a plane at the body's top) and `_top` (cm).
+_TOP_DOWN_SKETCH = (
+    "# Sketch at the TARGET body's top and cut DOWN from there. These tools\n"
+    "# used to sketch at z=0 and cut toward -Z, which missed every body built\n"
+    "# upward from XY - e.g. by create_box (verified live against 1.9.0).\n"
+    "_top = body.boundingBox.maxPoint.z\n"
+    "_pname = 'mcp_hole_plane_z%gmm' % round(_top * 10, 4)\n"
+    "_pl = root.constructionPlanes.itemByName(_pname)\n"
+    "if _pl is None:\n"
+    "    _ci = root.constructionPlanes.createInput()\n"
+    "    _ci.setByOffset(root.xYConstructionPlane, adsk.core.ValueInput.createByReal(_top))\n"
+    "    _pl = root.constructionPlanes.add(_ci)\n"
+    "    _pl.name = _pname\n"
+    "    _pl.isLightBulbOn = False   # a drilling reference, not geometry\n"
+    "sk = root.sketches.add(_pl)   # measured: sketch +X/+Y = world +X/+Y\n"
+)
+
+
 @mcp.tool()
 def drill_hole(diameter_mm: float, x_mm: float, y_mm: float,
                depth_mm: float, body_index: int = 0) -> str:
-    """Cut a circular hole straight down (-Z) from the XY plane at (x, y) to the
-    given depth. Cuts only body `body_index` - other bodies the hole passes
-    through are left alone. For holes on other faces use sketch_on_face +
-    hole_on_face."""
+    """Cut a circular hole straight down at (x, y), depth_mm deep measured from
+    the TOP of body `body_index` (its highest point). Only that body is cut -
+    other bodies the hole passes through are left alone. The drilling plane is
+    a hidden construction plane named mcp_hole_plane_z<height>mm, reused by
+    later holes at the same height. For holes on other faces use
+    sketch_on_face + hole_on_face."""
     R, D = diameter_mm / 20.0, depth_mm / 10.0
     x, y = x_mm / 10.0, y_mm / 10.0
     code = (
@@ -866,7 +887,7 @@ def drill_hole(diameter_mm: float, x_mm: float, y_mm: float,
         "root = design.rootComponent\n"
         "body = root.bRepBodies.item({bi})\n"
         "_before = sum((b.volume if b.isValid else 0) for b in root.bRepBodies)\n"
-        "sk = root.sketches.add(root.xYConstructionPlane)\n"
+        + _TOP_DOWN_SKETCH +
         "ctr = adsk.core.Point3D.create({x}, {y}, 0)\n"
         "sk.sketchCurves.sketchCircles.addByCenterRadius(ctr, {R})\n"
         "prof = sk.profiles.item(0)\n"
@@ -879,10 +900,11 @@ def drill_hole(diameter_mm: float, x_mm: float, y_mm: float,
         "ext.add(inp)\n"
         "_after = sum((b.volume if b.isValid else 0) for b in root.bRepBodies)\n"
         "_delta = _after - _before\n"
-        "print('hole cut at ({xm}, {ym}) mm | volume delta: {{:+.4f}} cm^3'.format(_delta))\n"
+        "print('hole cut at ({xm}, {ym}) mm, {dpm} mm deep from the top of %s (z=%.2f mm) | volume delta: %+.4f cm^3'\n"
+        "      % (body.name, _top * 10, _delta))\n"
         "if abs(_delta) < 1e-7:\n"
         "    print('WARNING: volume delta ~ZERO - the cut had NO effect (missed the body or wrong depth/location).')\n"
-    ).format(x=x, y=y, R=R, D=D, xm=x_mm, ym=y_mm, bi=body_index)
+    ).format(x=x, y=y, R=R, D=D, xm=x_mm, ym=y_mm, bi=body_index, dpm=depth_mm)
     return _send(code)
 
 
@@ -1058,8 +1080,8 @@ def _tap_drill(thread_size: str):
 def tapped_hole(thread_size: str, x_mm: float, y_mm: float, depth_mm: float,
                 body_index: int = 0, tap_drill_only: bool = True,
                 tap_drill_mm: float = None) -> str:
-    """Create a tapped hole on the top (XY) plane, cutting downward, into body
-    `body_index` only.
+    """Create a tapped hole at (x, y), cutting straight down from the TOP of
+    body `body_index` (its highest point); only that body is cut.
 
     thread_size: e.g. 'M3', 'M4x0.7', 'M8x1' (fine pitch), '#6-32', '10-32',
     '1/4-20' - case-insensitive. Metric drills are major minus pitch, so any
@@ -1090,7 +1112,7 @@ def tapped_hole(thread_size: str, x_mm: float, y_mm: float, depth_mm: float,
         "body = root.bRepBodies.item({bi})\n"
         "_ts = {ts!r}\n"
         "_before = sum((b.volume if b.isValid else 0) for b in root.bRepBodies)\n"
-        "sk = root.sketches.add(root.xYConstructionPlane)\n"
+        + _TOP_DOWN_SKETCH +
         "ctr = adsk.core.Point3D.create({x}, {y}, 0)\n"
         "sk.sketchCurves.sketchCircles.addByCenterRadius(ctr, {R})\n"
         "prof = sk.profiles.item(0)\n"
@@ -1101,88 +1123,102 @@ def tapped_hole(thread_size: str, x_mm: float, y_mm: float, depth_mm: float,
         "hole = ext.add(inp)\n"
         "_after = sum((b.volume if b.isValid else 0) for b in root.bRepBodies)\n"
         "_delta = _after - _before\n"
-        "print('tap-drill hole (' + _ts + ', dia {dmm}mm) cut at ({xm},{ym})mm | volume delta: ' + '{{:+.4f}}'.format(_delta) + ' cm^3')\n"
+        "print('tap-drill hole (%s, dia {dmm}mm) cut at ({xm},{ym})mm, {dpm}mm deep from the top of %s (z=%.2fmm) | volume delta: %+.4f cm^3'\n"
+        "      % (_ts, body.name, _top * 10, _delta))\n"
         "if abs(_delta) < 1e-7:\n"
         "    print('WARNING: volume delta ~ZERO - tap-drill cut had NO effect (missed body / wrong location / depth).')\n"
-        "if not {tdo}:\n"
-        "    KIND = {kind!r}\n"
-        "    MAJOR = {size!r}\n"
-        "    PITCH = {pitch!r}\n"
-        "    _applied = None\n"
-        "    _why = 'unknown'\n"
-        "    try:\n"
-        "        import re as _re\n"
-        "        threads = root.features.threadFeatures\n"
-        "        q = threads.threadDataQuery\n"
-        "        tclass = None\n"
-        "        if KIND == 'metric':\n"
-        "            tclass = q.defaultMetricThreadType\n"
-        "        elif KIND == 'unified':\n"
-        "            tclass = q.defaultInchThreadType\n"
-        "        else:\n"
-        "            _why = 'designation %r cannot be matched to a Fusion thread' % _ts\n"
-        "        size = None\n"
-        "        if tclass:\n"
-        "            ok, sizes = q.getAllSizes(tclass)\n"
-        "            for s in (sizes or []):\n"
-        "                ss = s.replace(' ', '').upper()\n"
-        "                if KIND == 'metric':\n"
-        "                    try:\n"
-        "                        if abs(float(ss) - MAJOR) < 1e-6:\n"
-        "                            size = s\n"
-        "                            break\n"
-        "                    except ValueError:\n"
-        "                        pass\n"
-        "                elif ss == MAJOR:\n"
-        "                    size = s\n"
-        "                    break\n"
-        "            if size is None:\n"
-        "                _why = 'thread type %r has no size %r' % (tclass, MAJOR)\n"
-        "        desig = None\n"
-        "        if size is not None:\n"
-        "            ok2, desigs = q.getAllDesignations(tclass, size)\n"
-        "            for dsg in (desigs or []):\n"
-        "                du = dsg.replace(' ', '').upper()\n"
-        "                if KIND == 'metric':\n"
-        "                    _m = _re.match(r'M([\\d.]+)X([\\d.]+)', du)\n"
-        "                    if _m and abs(float(_m.group(2)) - PITCH) < 1e-6:\n"
-        "                        desig = dsg\n"
-        "                        break\n"
-        "                else:\n"
-        "                    want = '%s-%d' % (MAJOR, PITCH)\n"
-        "                    if du.startswith(want) and not du[len(want):len(want) + 1].isdigit():\n"
-        "                        desig = dsg\n"
-        "                        break\n"
-        "            if desig is None:\n"
-        "                _why = 'no %s designation among the %d Fusion offers for size %r' % (_ts, len(desigs or []), size)\n"
-        "        side = None\n"
-        "        for f in hole.sideFaces:\n"
-        "            side = f\n"
-        "            break\n"
-        "        if desig and side is None:\n"
-        "            _why = 'the cut produced no side face to thread'\n"
-        "        if desig and side is not None:\n"
-        "            ok3, classes = q.getAllClasses(True, tclass, desig)\n"
-        "            cls = classes[0] if (ok3 and classes) else ''\n"
-        "            # createThreadInfo(isInternal, threadType, designation, class)\n"
-        "            tinfo = threads.createThreadInfo(True, tclass, desig, cls)\n"
-        "            fc = adsk.core.ObjectCollection.create()\n"
-        "            fc.add(side)\n"
-        "            tin = threads.createInput(fc, tinfo)\n"
-        "            tin.isModeled = True\n"
-        "            threads.add(tin)\n"
-        "            _applied = '%s %s' % (desig, cls)\n"
-        "    except Exception as _te:\n"
-        "        _why = str(_te)[:120]\n"
-        "    if _applied:\n"
-        "        print('modeled thread applied: ' + _applied)\n"
-        "    else:\n"
-        "        print('WARNING: modeled thread NOT applied (%s). The tap-drill hole '\n"
-        "              'above was cut.' % _why)\n"
     ).format(bi=body_index, x=x, y=y, R=drill, D=D, ts=canon, dmm=drill_mm,
-             xm=x_mm, ym=y_mm, tdo=tap_drill_only, kind=kind, size=size,
-             pitch=pitch)
+             xm=x_mm, ym=y_mm, dpm=depth_mm)
+    if not tap_drill_only:
+        code += _modeled_thread_code(canon, kind, size, pitch)
     return _send(code)
+
+
+def _modeled_thread_code(canon, kind, size, pitch) -> str:
+    """Generated code that puts a modeled internal thread on the side face of
+    `hole` (an ExtrudeFeature in `root`).
+
+    Written against the ThreadDataQuery API as it actually behaves (checked
+    live): allSizes / allDesignations / allClasses return sequences directly.
+    The getAll* methods called before 1.9.1 do not exist, so modeled threads
+    never worked. Fusion lists inch sizes as decimal inches, some labelled
+    ('0.19(#10)', '0.25'), and inch designations drop the '#' ('10-32 UNF')."""
+    return (
+        "_ts = " + repr(canon) + "\n"
+        "KIND = " + repr(kind) + "\n"
+        "MAJOR = " + repr(size) + "\n"
+        "PITCH = " + repr(pitch) + "\n"
+        "_applied = None\n"
+        "_why = 'unknown'\n"
+        "try:\n"
+        "    import re as _re\n"
+        "    threads = root.features.threadFeatures\n"
+        "    q = threads.threadDataQuery\n"
+        "    tclass = None\n"
+        "    if KIND == 'metric':\n"
+        "        tclass = q.defaultMetricThreadType\n"
+        "        want_d = MAJOR\n"
+        "    elif KIND == 'unified':\n"
+        "        tclass = q.defaultInchThreadType\n"
+        "        # nominal diameter in inches: #n -> 0.060 + 0.013n; a/b -> a/b\n"
+        "        if MAJOR.startswith('#'):\n"
+        "            want_d = 0.060 + 0.013 * int(MAJOR[1:])\n"
+        "        else:\n"
+        "            _n, _dn = MAJOR.split('/')\n"
+        "            want_d = float(_n) / float(_dn)\n"
+        "    else:\n"
+        "        _why = 'designation %r cannot be matched to a Fusion thread' % _ts\n"
+        "    size = None\n"
+        "    if tclass:\n"
+        "        for s in q.allSizes(tclass):\n"
+        "            _m = _re.match(r'[\\d.]+', s)\n"
+        "            if _m and abs(float(_m.group(0)) - want_d) < 1e-3:\n"
+        "                size = s\n"
+        "                break\n"
+        "        if size is None:\n"
+        "            _why = 'thread type %r has no size for %s' % (tclass, _ts)\n"
+        "    desig = None\n"
+        "    if size is not None:\n"
+        "        desigs = list(q.allDesignations(tclass, size))\n"
+        "        for dsg in desigs:\n"
+        "            du = dsg.replace(' ', '').upper()\n"
+        "            if KIND == 'metric':\n"
+        "                _m = _re.match(r'M([\\d.]+)X([\\d.]+)', du)\n"
+        "                if _m and abs(float(_m.group(2)) - PITCH) < 1e-6:\n"
+        "                    desig = dsg\n"
+        "                    break\n"
+        "            else:\n"
+        "                want = '%s-%d' % (MAJOR.lstrip('#'), PITCH)\n"
+        "                if du.startswith(want) and not du[len(want):len(want) + 1].isdigit():\n"
+        "                    desig = dsg\n"
+        "                    break\n"
+        "        if desig is None:\n"
+        "            _why = 'none of %s matches %s' % (desigs, _ts)\n"
+        "    side = None\n"
+        "    for f in hole.sideFaces:\n"
+        "        side = f\n"
+        "        break\n"
+        "    if desig and side is None:\n"
+        "        _why = 'the cut produced no side face to thread'\n"
+        "    if desig and side is not None:\n"
+        "        classes = list(q.allClasses(True, tclass, desig))\n"
+        "        # the usual default fit: 6H metric, 2B unified\n"
+        "        cls = next((c for c in classes if c in ('6H', '2B')),\n"
+        "                   classes[0] if classes else '')\n"
+        "        # createThreadInfo(isInternal, threadType, designation, class)\n"
+        "        tinfo = threads.createThreadInfo(True, tclass, desig, cls)\n"
+        "        tin = threads.createInput(side, tinfo)\n"
+        "        tin.isModeled = True\n"
+        "        threads.add(tin)\n"
+        "        _applied = '%s %s' % (desig, cls)\n"
+        "except Exception as _te:\n"
+        "    _why = str(_te)[:120]\n"
+        "if _applied:\n"
+        "    print('modeled thread applied: ' + _applied)\n"
+        "else:\n"
+        "    print('WARNING: modeled thread NOT applied (%s). The tap-drill hole '\n"
+        "          'above was cut.' % _why)\n"
+    )
 
 
 # ==========================================================================
@@ -1673,7 +1709,9 @@ def set_view(orientation: str = "iso") -> str:
 @mcp.tool()
 def create_component(name: str) -> str:
     """Create a new empty component placed as an occurrence at the assembly
-    origin. Returns its fullPathName. One component per distinct part."""
+    origin. Returns its fullPathName. One component per distinct part.
+    Needs an Assembly design: Fusion refuses a second component in a Part
+    design ("add this Part to an Assembly")."""
     code = (
         "design = _require_design()\n"
         "root = design.rootComponent\n"
@@ -1687,15 +1725,23 @@ def create_component(name: str) -> str:
 
 @mcp.tool()
 def list_components() -> str:
-    """List all occurrences with component name and origin position (mm)."""
+    """List all occurrences with component name, origin position (mm) and
+    grounding: grounded / grounded to parent / free. Only a free part can be
+    moved by a joint."""
     code = (
         "design = _require_design()\n"
         "root = design.rootComponent\n"
         "lines = []\n"
         "for occ in root.allOccurrences:\n"
         "    t = occ.transform.translation\n"
+        "    if occ.isGrounded:\n"
+        "        _g = 'grounded'\n"
+        "    elif getattr(occ, 'isGroundToParent', False):\n"
+        "        _g = 'grounded to parent'\n"
+        "    else:\n"
+        "        _g = 'free'\n"
         "    lines.append(occ.fullPathName + '  [' + occ.component.name + ']  pos=(' +\n"
-        "        '{:.1f},{:.1f},{:.1f}'.format(t.x*10,t.y*10,t.z*10) + ')mm')\n"
+        "        '{:.1f},{:.1f},{:.1f}'.format(t.x*10,t.y*10,t.z*10) + ')mm  ' + _g)\n"
         "print('\\n'.join(lines) if lines else 'no components (geometry is in root)')\n"
     )
     return _send(code, compact=False)
@@ -1794,16 +1840,31 @@ def ground_component(component_name: str, grounded: bool = True) -> str:
     """Ground (lock in space) or unground an occurrence. An assembly needs
     exactly one grounded base so other parts joint relative to it. Ground base
     first. Accepts an occurrence name ('Base:1') or an unambiguous component
-    name."""
+    name. Ungrounding also clears Fusion's separate 'ground to parent' flag,
+    which otherwise keeps the part fixed. Reads both flags back and prints
+    CONFIRMED only if the part really is in the requested state."""
     code = (
         "design = _require_design()\n"
         "root = design.rootComponent\n"
         "# an occurrence name ('Screw:3') picks one copy; a bare component\n"
         "# name is accepted only if exactly one occurrence uses it\n"
         "target = find_occurrence({cn!r})\n"
-        "if target is not None:\n"
-        "    target.isGrounded = {g}\n"
-        "    print(str({cn!r}) + ' grounded={g}')\n"
+        "want = {g}\n"
+        "target.isGrounded = want\n"
+        "# Fusion also has a separate 'ground to parent' flag. A part can carry\n"
+        "# it with isGrounded False and still be fixed: this tool used to clear\n"
+        "# isGrounded only and print grounded=False (observed live).\n"
+        "if not want and hasattr(target, 'isGroundToParent'):\n"
+        "    target.isGroundToParent = False\n"
+        "g = target.isGrounded\n"
+        "gp = getattr(target, 'isGroundToParent', False)\n"
+        "fixed = bool(g or gp)\n"
+        "if fixed == want:\n"
+        "    print('CONFIRMED: %s is %s (isGrounded=%s, isGroundToParent=%s)'\n"
+        "          % (target.name, 'grounded' if fixed else 'free to move', g, gp))\n"
+        "else:\n"
+        "    print('*** NOT APPLIED: asked for grounded=%s, but %s reads '\n"
+        "          'isGrounded=%s, isGroundToParent=%s. ***' % (want, target.name, g, gp))\n"
     ).format(cn=component_name, g=grounded)
     return _send(code)
 
@@ -1828,8 +1889,9 @@ def _joint_args_error(motion: str, axis: str) -> str:
 
 @mcp.tool()
 def rigid_joint(component_a: str, component_b: str) -> str:
-    """Create a RIGID joint locking two components together at their current
-    relative position, referencing each component's origin point."""
+    """Create a RIGID joint between two components' origin points. Fusion moves
+    component_a onto component_b - pass the grounded base as component_b.
+    CONFIRMED only when the joint solves and its points coincide."""
     code = _joint_code(component_a, component_b, "rigid", "z",
                        use_origin=True, ax=0, ay=0, az=0, bx=0, by=0, bz=0)
     return _send(code)
@@ -1838,7 +1900,8 @@ def rigid_joint(component_a: str, component_b: str) -> str:
 @mcp.tool()
 def revolute_joint(component_a: str, component_b: str, axis: str = "z") -> str:
     """Create a REVOLUTE joint (one rotational DOF) about axis (x/y/z) at the
-    components' origins. For hinges, lids, swinging arms."""
+    components' origins. For hinges, lids, swinging arms. Fusion moves
+    component_a onto component_b - pass the grounded base as component_b."""
     err = _joint_args_error("revolute", axis)
     if err:
         return err
@@ -1852,8 +1915,11 @@ def joint_at_point(component_a: str, ax_mm: float, ay_mm: float, az_mm: float,
                    component_b: str, bx_mm: float, by_mm: float, bz_mm: float,
                    motion: str = "rigid", axis: str = "z") -> str:
     """Joint two components at explicit LOCAL points (each component's own
-    coordinate space, mm) rather than their origins. Creates a construction
-    point on each, then joins. motion: 'rigid' or 'revolute'; axis for revolute."""
+    coordinate space, mm) rather than their origins. Creates a hidden sketch
+    point (sketch 'mcp_joint_point') in each component, then joins. motion:
+    'rigid' or 'revolute'; axis for revolute. Fusion moves component_a onto
+    component_b - pass the grounded base as component_b. Needs an Assembly
+    design - a Part design can hold only one component."""
     err = _joint_args_error(motion, axis)
     if err:
         return err
@@ -1883,31 +1949,51 @@ def list_joints() -> str:
 
 
 def _joint_code(ca, cb, motion, axis, use_origin, ax, ay, az, bx, by, bz):
-    """Shared joint builder. Not a tool (no decorator) - internal helper."""
+    """Shared joint builder. Not a tool (no decorator) - internal helper.
+
+    Fusion moves component_a onto component_b (verified live: "First
+    component to move is grounded, it can not move"). So:
+    - an explicitly grounded component_a is refused - it cannot move;
+    - a component_a that is only 'grounded to parent' (a separate Fusion flag,
+      observed live on a part whose isGrounded was False) is freed, and the
+      output says so - otherwise the joint is created but can never solve;
+    - CONFIRMED requires the joint to be healthy AND its two points to
+      coincide in world space. A joint count going up is not enough: Fusion
+      adds an unsolvable joint and only flags its health."""
     axdir = _JOINT_AXES[axis]   # validated by the calling tool
     if use_origin:
         geo_setup = (
-            "    ga = adsk.fusion.JointGeometry.createByPoint(\n"
-            "        a.component.originConstructionPoint.createForAssemblyContext(a))\n"
-            "    gb = adsk.fusion.JointGeometry.createByPoint(\n"
-            "        b.component.originConstructionPoint.createForAssemblyContext(b))\n"
+            "_pa_local = (0.0, 0.0, 0.0)\n"
+            "_pb_local = (0.0, 0.0, 0.0)\n"
+            "ga = adsk.fusion.JointGeometry.createByPoint(\n"
+            "    a.component.originConstructionPoint.createForAssemblyContext(a))\n"
+            "gb = adsk.fusion.JointGeometry.createByPoint(\n"
+            "    b.component.originConstructionPoint.createForAssemblyContext(b))\n"
         )
     else:
         geo_setup = (
-            "    def addpt(comp, x, y, z):\n"
-            "        ip = comp.constructionPoints.createInput()\n"
-            "        ip.setByPoint(adsk.core.Point3D.create(x, y, z))\n"
-            "        return comp.constructionPoints.add(ip)\n"
-            "    pa = addpt(a.component, {ax}, {ay}, {az})\n"
-            "    pb = addpt(b.component, {bx}, {by}, {bz})\n"
-            "    ga = adsk.fusion.JointGeometry.createByPoint(pa.createForAssemblyContext(a))\n"
-            "    gb = adsk.fusion.JointGeometry.createByPoint(pb.createForAssemblyContext(b))\n"
+            "# A construction point built from a raw coordinate raises\n"
+            "# 'Environment is not supported' in parametric designs (verified\n"
+            "# live). A sketch point works, and JointGeometry takes it directly.\n"
+            "def addpt(comp, x, y, z):\n"
+            "    sk = comp.sketches.add(comp.xYConstructionPlane)\n"
+            "    sk.name = 'mcp_joint_point'\n"
+            "    _helpers.append(sk)\n"
+            "    sp = sk.sketchPoints.add(adsk.core.Point3D.create(x, y, z))\n"
+            "    sk.isVisible = False\n"
+            "    return sp\n"
+            "_pa_local = ({ax}, {ay}, {az})\n"
+            "_pb_local = ({bx}, {by}, {bz})\n"
+            "pa = addpt(a.component, *_pa_local)\n"
+            "pb = addpt(b.component, *_pb_local)\n"
+            "ga = adsk.fusion.JointGeometry.createByPoint(pa.createForAssemblyContext(a))\n"
+            "gb = adsk.fusion.JointGeometry.createByPoint(pb.createForAssemblyContext(b))\n"
         ).format(ax=ax, ay=ay, az=az, bx=bx, by=by, bz=bz)
 
     motion_setup = (
-        "    ji.setAsRevoluteJointMotion(adsk.fusion.JointDirections.{ad})\n".format(ad=axdir)
+        "ji.setAsRevoluteJointMotion(adsk.fusion.JointDirections.{ad})\n".format(ad=axdir)
         if motion == "revolute" else
-        "    ji.setAsRigidJointMotion()\n"
+        "ji.setAsRigidJointMotion()\n"
     )
 
     return (
@@ -1917,20 +2003,48 @@ def _joint_code(ca, cb, motion, axis, use_origin, ax, ay, az, bx, by, bz):
         "# or an ambiguous name raises with the list of valid names\n"
         "a = find_occurrence({ca!r})\n"
         "b = find_occurrence({cb!r})\n"
-        "if a is not None and b is not None:\n"
+        "if a.isGrounded:\n"
+        "    raise RuntimeError(\n"
+        "        '%s is grounded, so it cannot move - and a joint moves component_a '\n"
+        "        'onto component_b. Pass the grounded base as component_b, or '\n"
+        "        'unground this part first.' % a.name)\n"
+        "if getattr(a, 'isGroundToParent', False):\n"
+        "    a.isGroundToParent = False\n"
+        "    print('note: %s was grounded to its parent; freed it so the joint can '\n"
+        "          'move it' % a.name)\n"
+        "_helpers = []\n"
         + geo_setup +
-        "    _jbefore = root.joints.count\n"
-        "    ji = root.joints.createInput(ga, gb)\n"
+        "_jbefore = root.joints.count\n"
+        "ji = root.joints.createInput(ga, gb)\n"
         + motion_setup +
-        "    root.joints.add(ji)\n"
-        "    _jafter = root.joints.count\n"
-        "    if _jafter > _jbefore:\n"
-        "        print('CONFIRMED: {motion} joint created (' + str(_jbefore) + ' -> '\n"
-        "              + str(_jafter) + ' joints): ' + str({ca!r}) + ' <-> ' + str({cb!r}))\n"
-        "    else:\n"
-        "        print('*** JOINT NOT CREATED: add() returned without error but the '\n"
-        "              'joint count did not change (' + str(_jbefore) + '). Do NOT '\n"
-        "              'report these parts as jointed. ***')\n"
+        "try:\n"
+        "    j = root.joints.add(ji)\n"
+        "except Exception:\n"
+        "    for _s in _helpers:        # leave no helper sketches behind\n"
+        "        try:\n"
+        "            _s.deleteMe()\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "    raise\n"
+        "def _world(occ, p):\n"
+        "    q = adsk.core.Point3D.create(*p)\n"
+        "    q.transformBy(occ.transform2)\n"
+        "    return q\n"
+        "_gap = _world(a, _pa_local).distanceTo(_world(b, _pb_local)) * 10.0\n"
+        "if root.joints.count <= _jbefore:\n"
+        "    print('*** JOINT NOT CREATED: add() returned without error but the '\n"
+        "          'joint count did not change (%d). Do NOT report these parts as '\n"
+        "          'jointed. ***' % _jbefore)\n"
+        "elif j.healthState != 0:\n"
+        "    _msg = (getattr(j, 'errorOrWarningMessage', '') or '').split('\\n')[0]\n"
+        "    print('*** JOINT CREATED BUT NOT SOLVED (health %s): %s Do NOT report '\n"
+        "          'these parts as jointed. ***' % (j.healthState, _msg))\n"
+        "elif _gap > 1e-3:\n"
+        "    print('*** JOINT UNCONFIRMED: %s reports healthy, but its two points are '\n"
+        "          '%.4f mm apart. ***' % (j.name, _gap))\n"
+        "else:\n"
+        "    print('CONFIRMED: {motion} joint %s solved - %s <-> %s, joint points '\n"
+        "          'coincide (%.4f mm)' % (j.name, a.name, b.name, _gap))\n"
     ).format(ca=ca, cb=cb, motion=motion)
 
 
@@ -3055,6 +3169,7 @@ def sweep_tube_check(path_sketch_index: int = -1, tube_radius_mm: float = 1.0,
         "print('path sketch: %s (%d curve(s))' % (sk.name, sk.sketchCurves.count))\n"
         "worst = None\n"
         "total = 0.0\n"
+        "_cerr = []\n"
         "for ci in range(sk.sketchCurves.count):\n"
         "    try:\n"
         "        c = sk.sketchCurves.item(ci)\n"
@@ -3068,12 +3183,16 @@ def sweep_tube_check(path_sketch_index: int = -1, tube_radius_mm: float = 1.0,
         "        for k in range(N + 1):\n"
         "            t = p0 + (p1 - p0) * k / float(N)\n"
         "            try:\n"
-        "                okc, curv = ev.getCurvature(t)\n"
-        "            except Exception:\n"
+        "                # returns (ok, direction, curvature in 1/cm). It used to be\n"
+        "                # unpacked as two values, so EVERY sample raised and the\n"
+        "                # tool reported 'could not measure' on any path.\n"
+        "                okc, _cdir, curv = ev.getCurvature(t)\n"
+        "            except Exception as _ce:\n"
+        "                _cerr.append(str(_ce)[:80])\n"
         "                continue\n"
         "            if not okc:\n"
         "                continue\n"
-        "            mag = curv if isinstance(curv, float) else getattr(curv, 'length', 0.0)\n"
+        "            mag = abs(float(curv))\n"
         "            if mag and mag > 1e-9:\n"
         "                rad_mm = (1.0 / mag) * 10.0\n"
         "                if worst is None or rad_mm < worst[0]:\n"
@@ -3081,8 +3200,13 @@ def sweep_tube_check(path_sketch_index: int = -1, tube_radius_mm: float = 1.0,
         "    except Exception as _e:\n"
         "        print('  curve %d: could not evaluate (%s)' % (ci, str(_e)[:50]))\n"
         "print('total path length ~%.2f mm' % total)\n"
-        "if worst is None:\n"
-        "    print('could not measure curvature (straight segments only?)')\n"
+        "if worst is None and _cerr:\n"
+        "    print('*** WARNING: curvature could not be evaluated (%d sample error(s), '\n"
+        "          'first: %s). The path was NOT checked. ***' % (len(_cerr), _cerr[0]))\n"
+        "elif worst is None:\n"
+        "    print('no curved segments - straight lines only. A sharp corner between '\n"
+        "          'segments acts as zero radius and WILL self-intersect a tube: '\n"
+        "          'fillet the corners first.')\n"
         "else:\n"
         "    print('minimum curvature radius %.3f mm (curve %d, parameter %.4f)'\n"
         "          % (worst[0], worst[1], worst[2]))\n"

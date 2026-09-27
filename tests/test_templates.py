@@ -91,3 +91,10 @@ def test_no_known_bad_patterns(srv, captured, name):
         # component lookups must go through find_component/find_occurrence,
         # which raise on a miss instead of falling back to the root
         assert "occ.component.name ==" not in code
+        # API shapes found wrong in a live Fusion run (1.9.0): these methods
+        # do not exist, and getCurvature returns THREE values
+        for bad in ("getAllSizes", "getAllDesignations", "getAllClasses",
+                    "okc, curv = ev.getCurvature",
+                    # raw-coordinate construction points fail in parametric designs
+                    "constructionPoints.createInput"):
+            assert bad not in code, bad

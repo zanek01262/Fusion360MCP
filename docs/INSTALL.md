@@ -215,6 +215,12 @@ A units slip somewhere in custom code. All tool arguments are millimeters;
 Fusion's API is centimeters. Ask Claude to verify with `get_model_state` or
 `measure_distance`.
 
+**"Failed to create component: Part Design documents can only contain one
+component."**
+Fusion now has separate Part and Assembly designs, and a Part design holds a
+single component. Components, copies and joints need an **Assembly** design —
+create one in Fusion (or add the part to an assembly) and work there.
+
 **Save / open / list-designs tools error.**
 Those need you signed into Fusion with an **active project** selected in the
 Data Panel. They don't work offline or on a brand-new unsaved doc.

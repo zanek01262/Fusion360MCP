@@ -1,5 +1,70 @@
 # Changelog
 
+## 1.9.1
+
+Six bugs found by running the tools in a live Fusion session - each written
+against the wrong API behaviour or trusting the wrong success signal, all
+predating 1.9.0, none visible to the simulated-API tests. All re-verified live
+after the fix. Protocol unchanged (3).
+
+### Fixed - `drill_hole` / `tapped_hole` missed bodies built upward from XY
+They sketched at z = 0 and cut toward -Z, so every `create_box` body was missed
+(the no-op warning fired; volume unchanged). They now sketch on a hidden
+construction plane at the target body's top (`mcp_hole_plane_z<height>mm`,
+looked up by name and shared by holes at the same height) and cut down.
+Verified: exact expected volume removed; a hole run deeper than the target
+body leaves the body below it untouched.
+
+### Fixed - modeled threads never applied
+`ThreadDataQuery` has `allSizes` / `allDesignations` / `allClasses`, returning
+sequences - not the `getAll*` methods called before. Matching now follows
+Fusion's real naming: inch sizes are decimal inches, some labelled
+('0.19(#10)'), and inch designations drop the '#' ('10-32 UNF'). Fit defaults
+to 6H / 2B. Moved into `_modeled_thread_code()`. Verified: M3x0.5 6H,
+1/4-20 UNC 2B.
+
+### Fixed - `sweep_tube_check` could never measure curvature
+`getCurvature` returns (ok, direction, curvature); it was unpacked as two
+values, so every sample raised and was skipped. Evaluation errors are now
+reported as a WARNING, and a straight-only path gets a sharp-corner reminder.
+Verified: 10.000 mm on a 10 mm arc.
+
+### Fixed - `joint_at_point` construction points
+`constructionPoints.add` with a raw Point3D raises "Environment is not
+supported" in parametric designs. Now a hidden sketch point per component
+(sketch `mcp_joint_point`). Verified end to end in an Assembly design.
+
+### Fixed - joint tools CONFIRMED joints that never solved
+Fusion adds an unsolvable joint and only flags `healthState`; the tools
+confirmed on joint count alone. CONFIRMED now needs health 0 AND the two joint
+points coincident in world space (via `transform2`); else NOT SOLVED /
+UNCONFIRMED. Fusion moves component_a onto component_b ("First component to
+move is grounded"): an explicitly grounded component_a is refused before any
+geometry is built, and one only grounded to its parent is freed and reported.
+A joint Fusion rejects has its helper sketches deleted. Verified live: rigid
+and revolute joints, origin- and point-based.
+
+### Fixed - `ground_component(grounded=False)` left parts fixed
+Occurrences also carry `isGroundToParent`; a part can have it with
+`isGrounded` off and still be fixed. Ungrounding clears both, and both are read
+back: CONFIRMED or NOT APPLIED. `list_components` shows each part's grounding.
+
+### Documented
+- Components need an Assembly design: Fusion Part designs allow one component
+  (`create_component` fails with "Part Design documents can only contain one
+  component").
+- `rigid_joint` moves component_a's origin onto component_b's; it was
+  described as locking the parts at their current relative position.
+
+### Tests
+- `tests/test_fusion_api_shapes.py`: fakes shaped like the real API (3-value
+  curvature, `all*` thread queries, Fusion's real size catalogue).
+- `tests/test_joints.py`: joints that solve, stay unsolved, report healthy but
+  apart, or are rejected; both grounding flags.
+- Known-bad API names added to the template check. All new tests fail against
+  1.9.0. 204 tests.
+
+
 ## 1.9.0
 
 A full-codebase review: one security hole, plus tools that reported success they
